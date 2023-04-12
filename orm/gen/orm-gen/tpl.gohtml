@@ -1,0 +1,28 @@
+package {{ .Package}}
+
+import(
+    "gotest/orm"
+    {{range $idx,$import := .Imports}}
+    {{$import}}
+    {{end}}
+)
+
+//希望通过外面传进去
+{{ $ops := .Ops}}
+
+{{range $idx,$type := .Types}}
+const(
+{{- range $jdx,$field := $type.Fields}}
+    //拼接你的类型名字，你的字段名字
+    {{$type.Name}}{{$field.Name}} = "{{$field.Name}}"
+{{- end}}
+)
+{{- range $jdx,$field := $type.Fields}}
+    {{- range $kdx,$op := $ops}}
+        func {{$type.Name}}{{$field.Name}}{{$op}}(val {{$field.Type}}) orm.Predicate{
+        return orm.C("{{$field.Name}}").{{$op}}(val)
+        }
+    {{- end}}
+{{- end}}
+{{end}}
+

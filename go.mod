@@ -19,6 +19,8 @@ require (
 	go.opentelemetry.io/otel/exporters/zipkin v1.13.0
 	go.opentelemetry.io/otel/sdk v1.13.0
 	go.opentelemetry.io/otel/trace v1.13.0
+	go.uber.org/atomic v1.10.0
+	google.golang.org/protobuf v1.28.1
 )
 
 require (
@@ -39,6 +41,5 @@ require (
 	github.com/prometheus/procfs v0.8.0 // indirect
 	github.com/smartystreets/assertions v1.2.0 // indirect
 	golang.org/x/sys v0.2.0 // indirect
-	google.golang.org/protobuf v1.28.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

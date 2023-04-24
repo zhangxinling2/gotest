@@ -95,6 +95,11 @@ func BuildInMapCacheWithEvictCallBack(fn func(key string, val any)) BuildInMapCa
 	}
 }
 func (b *BuildInMapCache) Set(ctx context.Context, key string, val any, expiration time.Duration) error {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	return b.set(key,val,expiration)
+}
+func (b *BuildInMapCache) set( key string, val any, expiration time.Duration) error {
 	var dl time.Time
 	//如果expiration = 0那么它就是没有过期时间
 	if expiration > 0 {
@@ -106,7 +111,6 @@ func (b *BuildInMapCache) Set(ctx context.Context, key string, val any, expirati
 	}
 	return nil
 }
-
 // Get 在Get时判断key有没有超时
 func (b *BuildInMapCache) Get(ctx context.Context, key string) (any, error) {
 	b.mutex.RLock()
@@ -131,6 +135,7 @@ func (b *BuildInMapCache) Get(ctx context.Context, key string) (any, error) {
 // Delete 删除map值,同时也返回值
 func (b *BuildInMapCache) Delete(ctx context.Context, key string) (any, error) {
 	b.mutex.RLock()
+	defer b.mutex.Unlock()
 	res, ok := b.data[key]
 	b.mutex.RUnlock()
 	if !ok {
@@ -138,8 +143,7 @@ func (b *BuildInMapCache) Delete(ctx context.Context, key string) (any, error) {
 	}
 	b.mutex.Lock()
 	b.delete(key)
-	b.mutex.Unlock()
-	return res, nil
+	return res.val, nil
 }
 func (b *BuildInMapCache) Close() error {
 	b.close <- struct{}{}

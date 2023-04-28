@@ -1403,7 +1403,7 @@ func (b *BuildInMapCache)Close()error{
 有三个地方需要回调：
 
 + Delete方法
-+ Get方法检查过期时间时
++ Get方法检查过期时间时，懒惰删除
 + 轮询删除过期key时
 
 evict回调函数设计：
@@ -1475,3 +1475,661 @@ func TestNewBuildInMapCache(t *testing.T) {
    require.Equal(t, cnt,1)
 }
 ```
+
+###### 控制本地缓存内存
+
+大多数时候都要考虑控制住内存使用量。在考虑内存使用量时要考虑缓存快满了的时候怎么腾出空间来。腾出空间就引出了我们常用的LRU、LFU算法。
+
+两种策略：
+
++ 控制键值对数量
++ 控制整体大小：需要计算每个对象的大小，然后累加。计算对象大小需要使用递归去计算对象中的对象。
+
+可以尝试使用装饰器模式来无侵入地支持这种功能。
+
+MaxCntCache直接组合BuildInMapCache的指针，为onEvict添加功能，还要重写Set方法，由于解锁后在return Set之前别的goroutine拿到锁还是可能设置值，导致计数多添加了，所以需要把Set中设置值的方法提取出来，这样就在锁住的时候进行set，把解锁用defer就不会出现并发问题了。
+
+设计：
+
+MaxCntCache直接组合BuildInMapCache的指针，并保存最大个数和当前个数：
+
+```go
+type MaxCntCache struct {
+   *BuildInMapCache
+   maxCnt int32
+   cnt int32
+}
+```
+
+在创建MaxCntCache时为onEvict新增计数减一功能：
+
+```go
+func NewMaxCntCache(b *BuildInMapCache,max int32)*MaxCntCache{
+   res:=&MaxCntCache{
+      BuildInMapCache: b,
+      maxCnt:          max,
+      cnt:             0,
+   }
+   evict:=b.onEvicted//原本的回调函数
+   b.onEvicted= func(key string, val any) {
+      atomic.AddInt32(&res.cnt,-1)
+      if evict!=nil{
+         evict(key,val)
+      }
+   }
+   return res
+}
+```
+
+重写Set
+
+```go
+func (c *MaxCntCache) Set(ctx context.Context, key string, val any, expiration time.Duration) error {
+   // 这种写法，如果 key 已经存在，你这计数就不准了
+   //cnt := atomic.AddInt32(&c.cnt, 1)
+   //if cnt > c.maxCnt {
+   // atomic.AddInt32(&c.cnt, -1)
+   // return errOverCapacity
+   //}
+   //return c.BuildInMapCache.Set(ctx, key, val, expiration)
+
+   //c.mutex.Lock()
+   //_, ok := c.data[key]
+   //if !ok {
+   // c.cnt ++
+   //}
+   //if c.cnt > c.maxCnt {
+   // c.mutex.Unlock()
+   // return errOverCapacity
+   //}
+   //c.mutex.Unlock()
+   //return c.BuildInMapCache.Set(ctx, key, val, expiration)
+
+   c.mutex.Lock()
+   defer c.mutex.Unlock()
+   _, ok := c.data[key]
+   if !ok {
+      if c.cnt + 1 > c.maxCnt {
+         // 后面，你可以在这里设计复杂的淘汰策略
+         return errOverCapacity
+      }
+      c.cnt ++
+   }
+   return c.set(key, val, expiration)
+}
+```
+
+##### Redis实现
+
+使用go-redis/redis/v9
+
+###### 设计
+
+RedisCache包含redis的客户端  redis.Cmdable,NewRedisCache时传入 redis.Cmdable，如果不是传入redis.Cmdable而是传一些config，类似addr之类的会很麻烦，要我们进行Cmdable初始化，而Cmdable有很多实现。传入 redis.Cmdable是一种依赖注入，在应用程序启动时，肯定会初始化。依赖注入，我不自己创建，让用户自己传入，我不需要关心Cmdable是哪种实现。
+
+```go
+var (
+   errFailedToSetCache = errors.New("cache: 写入 redis 失败")
+)
+type RedisCache struct {
+   client redis.Cmdable
+}
+func NewRedisCache(client redis.Cmdable)*RedisCache{
+   return &RedisCache{client: client}
+}
+
+func (r *RedisCache) Set(ctx context.Context, key string, val any, expiration time.Duration) error {
+   val,err:=r.client.Set(ctx,key,val,expiration).Result()
+   if err!=nil{
+      return err
+   }
+   if val!="OK"{
+      return errors.New(fmt.Sprintf("%w ,res: %s",errFailedToSetCache,err))
+   }
+   return nil
+}
+
+func (r *RedisCache) Get(ctx context.Context, key string) (any, error) {
+   return r.client.Get(ctx,key).Result()
+}
+
+func (r *RedisCache) Delete(ctx context.Context, key string) (any, error) {
+   return r.client.GetDel(ctx,key).Result()
+}
+```
+
+###### 单元测试
+
+单元测试如何生成client？使用mockgen来测试redis，在根目录下执行mockgen,因为单元测试不希望连上redis。testCases中的mock设计为传入*gomock.Controller返回redis.Cmdable的函数，使用gomock.NewController来创建控制器。
+
+在根目录下执行mockgen生成代码
+
+mockgen -destination=cache/mocks/mock_redis_cache.gen.go -package=mocks github.com/go-redis/redis/v9 Cmdable
+
+首先创建一个mock控制器：使用gomock.NewController(t)来创建controller，有了控制器就可以使用生成的代码来使用控制器。
+
+在测试用例中用mock func(ctrl *gomock.Controller)redis.Cmdable来创建cmdable，之后使用此cmdable执行EXPECT执行Set，return的Status使用redis.NewStatusCmd来创建以来模拟return。
+
+Set测正常设置，超时和返回不正常状态
+
+```go
+func TestRedisCache_Set(t *testing.T) {
+   testCases:=[]struct{
+      name string
+      mock func(ctrl *gomock.Controller)redis.Cmdable
+      key string
+      val string
+      expiration time.Duration
+      wantErr error
+   }{
+      {
+         name:       "set val",
+         mock: func(ctrl *gomock.Controller) redis.Cmdable {
+            cmd:=mocks.NewMockCmdable(ctrl)
+            status:=redis.NewStatusCmd(context.Background())
+            status.SetVal("OK")
+            cmd.EXPECT().Set(context.Background(),"key1","value1",time.Second).Return(status)
+            return cmd
+         },
+         key:        "key1",
+         val:        "value1",
+         expiration: time.Second,
+      },
+      {
+         name:       "expiration",
+         mock: func(ctrl *gomock.Controller) redis.Cmdable {
+            cmd:=mocks.NewMockCmdable(ctrl)
+            status:=redis.NewStatusCmd(context.Background())
+            status.SetErr(context.DeadlineExceeded)
+            cmd.EXPECT().Set(context.Background(),"key1","value1",time.Second).Return(status)
+            return cmd
+         },
+         key:        "key1",
+         val:        "value1",
+         expiration: time.Second,
+         wantErr: context.DeadlineExceeded,
+      },
+      {
+         name:       "unexpected msg",
+         mock: func(ctrl *gomock.Controller) redis.Cmdable {
+            cmd:=mocks.NewMockCmdable(ctrl)
+            status:=redis.NewStatusCmd(context.Background())
+            status.SetVal("un ok")
+            cmd.EXPECT().Set(context.Background(),"key1","value1",time.Second).Return(status)
+            return cmd
+         },
+         key:        "key1",
+         val:        "value1",
+         expiration: time.Second,
+         wantErr: errors.New(fmt.Sprintf("%v ,res: %s",errFailedToSetCache,"un ok")),
+      },
+   }
+   for _,tc:=range testCases{
+      t.Run(tc.name, func(t *testing.T) {
+         ctrl:=gomock.NewController(t)
+         defer ctrl.Finish()
+         rdb:=NewRedisCache(tc.mock(ctrl))
+         err:=rdb.Set(context.Background(),tc.key,tc.val,tc.expiration)
+         assert.Equal(t, tc.wantErr,err)
+      })
+   }
+}
+```
+
+而测试get需要把NewStatusCmd改为NewStringCmd，因为Get返回的是StringCmd。
+
+集成测试则需要实际的redis环境，使用docker打开redis。
+
+set在集成测试模拟不出来不"ok"和超时的情况。可以调用get来验证set。
+
+table driver类型有一个before和after，before用来准备数据，after则用来删除数据。
+
+```go
+func TestRedisCacheGet(t *testing.T) {
+   client:=redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+   c:=NewRedisCache(client)
+   ctx, cancel := context.WithTimeout(context.Background(), time.Second * 10)
+   defer cancel()
+   err := c.Set(ctx, "key1", "value1", time.Minute)
+   require.NoError(t, err)
+   val, err := c.Get(ctx, "key1")
+   require.NoError(t, err)
+   assert.Equal(t, "value1", val)
+}
+func TestRedisCacheGetV1(t *testing.T) {
+   rdb := redis.NewClient(&redis.Options{
+      Addr: "localhost:6379",
+   })
+
+   testCases := []struct{
+      name string
+      //before func(t *testing.T)
+      after func(t *testing.T)
+
+      key string
+      value string
+      expiration time.Duration
+
+      wantErr error
+   } {
+      {
+         name:"set value",
+         after: func(t *testing.T) {
+            ctx, cancel := context.WithTimeout(context.Background(), time.Second * 3)
+            defer cancel()
+            res, err := rdb.Get(ctx, "key1").Result()
+            require.NoError(t, err)
+            assert.Equal(t, "value1", res)
+            _, err = rdb.Del(ctx, "key1").Result()
+            require.NoError(t, err)
+         },
+         key: "key1",
+         value: "value1",
+         expiration: time.Minute,
+      },
+   }
+
+   for _, tc := range testCases {
+      t.Run(tc.name, func(t *testing.T) {
+         c := NewRedisCache(rdb)
+         //tc.before()
+         ctx, cancel := context.WithTimeout(context.Background(), time.Second * 3)
+         defer cancel()
+         err := c.Set(ctx, tc.key, tc.value, tc.expiration)
+         require.NoError(t, err)
+         tc.after(t)
+      })
+   }
+}
+```
+
+##### 组合API
+
+多个动作组合在一起，作为一个API提供出去：
+
++ LoadOrStore
++ LoadAndDelete
++ 自增自减API
+
+要注意：线程安全，在本地加锁就可以，在redis中可能就要使用lua脚本。
+
+#### 缓存模式
+
+##### cache aside
+
+什么缓存模式都不用cache aside,把cache当作一个普通的数据源，更新Cache和DB依赖于开发者自己写代码。
+
+业务代码可以做决策：
+
++ 未命中时是否要从DB取数据，如果不从DB取可以考虑使用默认值进行业务处理
++ 同步or异步读取数据并写入：同步：缓存中没有则去DB中读取，更新缓存后继续执行业务代码。半异步：业务代码会同步的从数据库读取数据，而后用DB数据执行业务，同时异步刷新缓存。异步：缓存没有数据那么就返回没有数据，继续执行业务代码，再另开一个goroutine来更新缓存。
++ 采用singleflight：如果有10个goroutine加载key1，派一个goroutine去取，其他goroutine用此goroutine取回的数据。
+
+**先写DB还是先写cache都会可能出现DB和cache不一致的问题，也就是不管怎么操作涉及缓存和数据库都会出现一致性问题。**
+
+##### Read-Through
+
+与cache aside的区别就是如果缓存没有数据，缓存去数据库中取数据，写数据的时候，业务代码需要自己写DB和写cache。
+
+cache可以做决策：
+
++ 未命中时是否要从DB取数据，如果不从DB取可以考虑使用默认值进行业务处理
++ 同步or异步读取数据并写入
++ 采用singleflight
+
+对用户来说，基本上只能是一个缓存类型一个实例
+
+例如userCache:=%ReadThroughCache
+
+这是因为Load Func在大多数时候没办法写成通用的。
+
+###### 实现
+
+装饰器模式：
+
+ReadThroughCache组合Cache，维持一个LoadFunc func(ctx,key)(any,error),除Cache，LoadFunc，其余都为后续设计添加
+
+```go
+type ReadThroughCache struct {
+   Cache
+   LoadFunc func(ctx context.Context,key string)(any,error)
+   expiration time.Duration
+   g *singleflight.Group
+}
+```
+
+只需要重新写Get方法，不管Cache是什么实现。
+
+Get方法：
+
+同步：先去缓存中取值，如果没有值，则使用LoadFunc来从数据库取值并set，那么超时时间从哪来？只能在ReadThroughCache放一个，要告诉用户ReadThroughCache一定要赋值LoadFunc和Expiration。如果Set Error了怎么办，返回一个哨兵错误，也可以不返回错误，也可以在log中输出。
+
+```go
+// Get 同步刷新缓存
+func(r *ReadThroughCache)Get(ctx context.Context,key string)(any,error){
+   //先从cache中取得值
+   val,err:=r.Cache.Get(ctx,key)
+   //没有值就可以进行LoadFunc
+   if err==errNoValue{
+      v,err:=r.LoadFunc(ctx,key)
+      //LoadFunc成功
+      if err==nil{
+         //取得值后就刷新缓存
+         er:=r.Set(ctx,key,v,r.expiration)
+         if er!=nil{
+            return nil,errors.New(fmt.Sprintf("%v,res: %s",errFailToRefreshCache,er))
+         }
+      }
+   }
+   return val, err
+}
+```
+
+异步：如果没有值就开一个goroutine去取值并做后续操作，但由于是个goroutine，如果Set Error了就不能返回错误，只能log。
+
+```go
+// GetV2 异步刷新缓存，就是在缓存为空后异步的读取值和刷新缓存，在Get后开个goroutine即可
+func(r *ReadThroughCache)GetV2(ctx context.Context,key string)(any,error){
+   //先从cache中取得值
+   val,err:=r.Cache.Get(ctx,key)
+   //没有值就可以进行LoadFunc
+   if err==errNoValue{
+      go func() {
+         v,err:=r.LoadFunc(ctx,key)
+         //LoadFunc成功
+         if err==nil{
+            //取得值后就刷新缓存
+            er:=r.Set(ctx,key,v,r.expiration)
+            if er!=nil{
+               //由于是goroutine，所以只能log记录一下
+               log.Printf("%v,res: %s",errFailToRefreshCache,er)
+            }
+         }
+      }()
+   }
+   return val, err
+}
+```
+
+半异步：在LoadFunc后开一个goroutine并做后续操作。
+
+```go
+// GetV1 半异步刷新缓存，就是在取得值后异步的刷新缓存，在LoadFunc后开个goroutine即可
+func(r *ReadThroughCache)GetV1(ctx context.Context,key string)(any,error){
+   //先从cache中取得值
+   val,err:=r.Cache.Get(ctx,key)
+   //没有值就可以进行LoadFunc
+   if err==errNoValue{
+      v,err:=r.LoadFunc(ctx,key)
+      //LoadFunc成功
+      if err==nil{
+         go func() {
+            //取得值后就刷新缓存
+            er:=r.Set(ctx,key,v,r.expiration)
+            if er!=nil{
+               //由于是goroutine，所以只能log记录一下
+               log.Printf("%v,res: %s",errFailToRefreshCache,er)
+            }
+         }()
+      }
+   }
+   return val, err
+}
+```
+
+singleflight:可以在ReadThroughCache中再放一个g *singleflight.Group,那么在g.Do中做LoadFunc和后续操作。
+
+```go
+// GetV3 Singleflight 在ReadThroughCache中再放一个g *singleflight.Group
+func(r *ReadThroughCache)GetV3(ctx context.Context,key string)(any,error){
+   //先从cache中取得值
+   val,err:=r.Cache.Get(ctx,key)
+   //没有值就可以进行LoadFunc
+   if err==errNoValue{
+      val,err,_=r.g.Do(key, func() (interface{}, error) {
+         v,er:=r.LoadFunc(ctx,key)
+         //LoadFunc成功
+         if er==nil{
+            //取得值后就刷新缓存
+            er=r.Set(ctx,key,v,r.expiration)
+            if er!=nil{
+               return nil,errors.New(fmt.Sprintf("%v,res: %s",errFailToRefreshCache,er))
+            }
+         }
+         return v,er
+      })
+   }
+   return val, err
+}
+```
+
+可以考虑使用泛型，这样就可以强制用户指定这个ReadThroughCache是用于哪个结构的。
+
+##### write-Through
+
+开发者只需要写入cache,cache会更新数据库，在读未命中缓存的情况下，开发者需要自己去数据库捞数据，然后更新缓存(此时缓存不需要更新DB了)。
+
+cache可以做决策：
+
++ 同步or异步写数据到DB，或者到cache
++ cache可以自由决定是先写DB还是先写cache。同步：cache会同步的将数据刷新到DB，而后返回相应，同时异步刷新缓存。异步：将请求给cache后就返回。
+
+###### 设计
+
+与readThrough相似，同样组合Cache，写一个StoreFunc func(ctx,key,val)error
+
+重写Set，先写DB还是先写cache都会出现不一致的问题，所以两个顺序不是很重要
+
+write_through与read_through设计类似，不过是一个写LoadFunc一个写StoreFunc
+
+##### write-back
+
+在写操作时写了缓存直接返回，不会直接更新数据库，读也是直接读缓存。在缓存过期时，将缓存写回去数据库。
+
+优缺点：
+
++ 所有goroutine都是读写缓存，不存在一致性问题(如果是本地缓存依旧会有问题)
++ 数据可能丢失：如果在缓存过期刷新到数据库之前，缓存宕机，那么会丢失数据
+
+如果不考虑丢失数据，那么它就是一致的。
+
+主要时利用onEvicted回调，在里面将数据刷新到DB里。
+
+用的不多，因为非常担忧数据丢失。
+
+##### refresh-ahead
+
+依赖于CDC(changed data capture)接口：
+
++ 数据库暴漏数据变更接口
++ cache或第四方监听到数据变更后自动更新数据
++ 如果读cache未命中，依旧要刷新缓存的话，依然会出现并发问题。
+
+#### 缓存异常
+
+##### 缓存穿透
+
++ 读请求对应的数据根本不存在，因此每次都会发起数据库请求，数据库返回NULL，所以下一次请求依旧会打到数据库。
++ 关键点就是这个数据根本没有，所以不会回写缓存。
++ 一般是黑客使用了一些非法的请求。
+
+##### 缓存击穿
+
++ 缓存没有对应key的数据而DB有
++ 一般情况下，不会导致严重问题，但是如果该key的访问量非常大，都去数据库查询，可能压垮数据库。一般没有问题，因为数据库对读请求的支持非常大。
++ 击穿和穿透比起来，关键在于击穿本身数据在DB中是有的，只是缓存里没有，所以只要回写到缓存，此一次访问就是命中缓存。
+
+##### 缓存雪崩：
+
++ 同一时刻，大量key过期，查询都要回查数据库
++ 常见场景是缓存预热，在启动时加载缓存，因为所有key的过期时间都一样，所以都在同一时间过期
+
+共性都是大量请求落在数据库，所以解决思路就是让这些请求不会落到数据库。
+
+##### singleflight
+
+此设计模式能够有效的减轻对数据库的压力。
+
+对数据库的压力本来是跟QPS相当，变为跟同一时刻不同key的数量和实例数量相当。热点越集中的应用效果越好。
+
+普通的singleflight是和cache aside一起使用的。也可以和read through结合做成一个装饰器模式。
+
+###### 实现一：
+
+SingleflightCache组合ReadThroughCache,在newSingleflightCacheV1中传入cache,loadfunc,expiration复写掉他们。与在readThrough直接放入一个singflight不同，这样是非侵入式的设计。
+
+这样只关注loadFunc，不需要重写Get方法。
+
+```go
+type SingleFlightCache struct {
+   ReadThroughCache
+}
+//NewSingleFlightCache 中传入cache,loadfunc,expiration复写掉他们。与在readThrough直接放入一个singflight不同，这样是非侵入式的设计。
+func NewSingleFlightCache(cache Cache,loadFunc   func(ctx context.Context, key string) (any, error),expiration time.Duration)*SingleFlightCache{
+   return &SingleFlightCache{ReadThroughCache{
+      Cache:      cache,
+      //只关注loadfunc而不关注同步异步
+      LoadFunc: func(ctx context.Context, key string) (any, error) {
+         g:=&singleflight.Group{}
+         val,err,_:=g.Do(key, func() (interface{}, error) {
+            return loadFunc(ctx,key)
+         })
+         return val, err
+      },
+      expiration: expiration,
+   }}
+}
+```
+
+###### 实现二：
+
+简单的装饰器模式，SingleflightCacheV1组合ReadThroughCache，持有一个singleflight.Group。Get的实现还是跟上述ReadThroughCache相同。
+
+```go
+type SingleFlightCacheV1 struct {
+   ReadThroughCache
+   g *singleflight.Group
+}
+func(r *SingleFlightCacheV1)Get(ctx context.Context, key string)(any, error){
+   val, err := r.Cache.Get(ctx, key)
+   if err == errNoValue {
+      val, err, _ = r.g.Do(key, func() (interface{}, error) {
+         v, er := r.LoadFunc(ctx, key)
+         if er == nil {
+            //_ = r.Cache.Set(ctx, key, val, r.Expiration)
+            er = r.Cache.Set(ctx, key, val, r.expiration)
+            if er != nil {
+               return v, fmt.Errorf("%w, 原因：%s", errFailToRefreshCache, er.Error())
+            }
+         }
+         return v, er
+      })
+   }
+   return val, err
+}
+```
+
+##### 缓存穿透解决方案
+
++ 使用singleflight能够缓解缓存问题，但如果攻击者时构造大量的不同的不存在的key，那么效果就不好了
++ 知道数据库里根本没有数据，缓存未命中就直接返回
+  + 缓存里是全量数据，如果未命中就可以直接返回
+  + 使用**布隆过滤器**，bit array等结构，未命中时就问一下这些结构
+
++ 缓存没有，直接使用默认值
++ 缓存未命中回表查询时，加上限流器
+
+###### 综合BloomFilter
+
+BloomFilter认为key存在，才会最终去DB查询。认为有不一定有，认为没有一定没有。
+
+###### 实现
+
+BoolmFilter接口有一个HasKey(ctx,key)bool方法
+
+```go
+type BloomFilter interface {
+   HasKey(ctx context.Context, key string) bool
+}
+```
+
+BoolmFilterCache组合ReadThroughCache，在NewBoolmFilterCache传入Cache和BoolmFilter和loadfunc，对LoadFunc方法进行装饰，跟singleflight类似。
+
+```go
+// BloomFilterCache 直接组合ReadThroughCache
+type BloomFilterCache struct {
+   ReadThroughCache
+}
+
+func NewBloomFilterCache(cache Cache, filter BloomFilter, LoadFunc func(ctx context.Context, key string) (any, error)) *BloomFilterCache {
+   return &BloomFilterCache{ReadThroughCache{
+      Cache: cache,
+      LoadFunc: func(ctx context.Context, key string) (any, error) {
+         if filter.HasKey(ctx, key) {
+            return LoadFunc(ctx, key)
+         }
+         return nil, errNoValue
+      },
+   }}
+}
+```
+
+直接对Get方法进行更改，跟singleflight类似。
+
+```go
+//BloomFilterCacheV1 组合ReadThroughCache,持有一个BloomFilter，直接修改Get方法
+type BloomFilterCacheV1 struct {
+   ReadThroughCache
+   bf BloomFilter
+}
+
+func (b *BloomFilterCacheV1) Get(ctx context.Context, key string) (any, error) {
+   val, err := b.Cache.Get(ctx, key)
+   if err != nil && b.bf.HasKey(ctx, key) {
+      val, err = b.LoadFunc(ctx, key)
+      if err == nil {
+         er := b.Cache.Set(ctx, key, val, b.expiration)
+         if er != nil {
+            return val, fmt.Errorf("%w, 原因：%s", errFailToRefreshCache, er.Error())
+         }
+      }
+   }
+   return val, err
+}
+```
+
+##### 缓存击穿解决方案
+
++ singleflight就足以解决问题，如果解决不了，那么大概率是因为DB需要扩容
++ 缓存未命中时，使用默认值
++ 在回查数据库时，加上限流器，不过这是保护系统，而不是解决问题
+
+##### 缓存雪崩解决方案
+
+设置key过期时间时，加一个随机偏移
+
+###### 实现
+
+RandomExpirationCache组合一个cache，重写Set方法
+
+#### 缓存实践
+
+##### 服务器优雅退出
+
+###### 概述
+
+假设我们现在有一个 Web 服务。这个 Web 服务会监听两个端口：8080和8081。其中 8080 是用于监听正常的业务请求，它会被暴露在外部网络中；而 8081 用于监听我们开发者的内部管理请求，只在内部使用。
+
+同时为了性能，我们在该服务中使用了本地缓存，并且采用了 write-back 的缓存模式。这个缓存模式要求，缓存在 key 过期的时候才将新值持久化到数据库中。这意味着在应用关闭的时候，我们必须将所有的 key 对应的数据都刷新到数据库中，否则会存在数据丢失的风险。
+
+###### 要求
+
+为了给用户更好的体验，我们希望你设计一个优雅退出的步骤，它需要完成：
+
+​    ● 监听系统信号，当收到 ctrl + C 的时候，应用要立刻拒绝新的请求
+
+​    ● 应用需要等待已经接收的请求被正常处理完成
+
+​    ● 应用关闭 8080 和 8081 两个服务器
+
+​    ● 我们能够注册一个退出的回调，在该回调内将缓存中的数据回写到数据库中

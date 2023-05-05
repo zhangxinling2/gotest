@@ -2363,7 +2363,7 @@ Client有TryLock(ctx,key,expiration)(*Lock,error),setNX如果不ok代表的是�
 
 Unlock定义在Client不够优雅，应该定义在Lock上这样TryLock返回的Lock就可以直接调用Unlock，如果定义在client上在unlock参数中也不能传key。
 
-Unlock放在Lock上那么Lock就需要redis.Cmdable和key来把键值对删掉。如果删除时，cnt!=1代表锁过期了或者有其他错误。
+Unlock放在Lock上那么Lock就需要持有redis.Cmdable和key来把键值对删掉。如果删除时，cnt!=1代表锁过期了或者有其他错误。
 
 ###### 为什么要有过期时间
 
@@ -2373,3 +2373,8 @@ Unlock放在Lock上那么Lock就需要redis.Cmdable和key来把键值对删掉�
 
 本质上我们需要一个唯一的值，用来比较这是某个实例加的锁，uuid是一个不错的选择，只要确保同一把锁的值不会冲突就可以。如果不确认锁那么可能会出现，实例1抢到锁执行业务，实例2等待锁，实例1锁过期，实例2抢到锁，实例1完成业务释放锁，实例2的锁被释放。那么Lock中就要继续加入value来存uuid。
 
+那么Unlock的实现就是先判断锁是不是自己的，就是从redis中get key利用uuid来判断，然后把键值对删除掉。但是在判断之后，删除掉之前，此键值对可能就被别的键值对给删除了，紧接着另外一个实例加锁。也就是说中间这里有一小段时间空缺，所以需要进行原子操作，让get到del中不能有人插入，所以就需要lua脚本。用lua脚本来替代上述操作。使用redis的eval，其中的lua语句参数可以在外面写完lua脚本后，使用go embed来嵌入进一个变量。
+
+###### lua脚本
+
+Lua脚本运行期间，为了避免被其他操作污染数据，这期间将不能执行其它命令，一直等到执行完毕才可以继续执行其它请求。当Lua脚本执行时间超过了lua-time-limit时，其他请求将会收到Busy错误，除非这些请求是SCRIPT KILL（杀掉脚本）或者SHUTDOWN NOSAVE（不保存结果直接关闭Redis）。

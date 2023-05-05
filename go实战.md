@@ -2347,7 +2347,7 @@ type App struct {
 
 ##### 分布式锁
 
-在分布式环境下不同实例之间抢一把锁。就是抢锁从进程变成了实例。难是因为基本都与网络有关。
+在分布式环境下不同实例之间抢一把锁。就是抢锁从进程变成了实例。难是因为基本都与网络有关。使用redis实现，加锁就是向redis中写值，解锁就是删除redis中的值。
 
 ##### setnx
 
@@ -2359,15 +2359,73 @@ type App struct {
 
 因为要与Redis通信，所以我们最好有一个抽象，封装redis.Cmdable,也就是对redis.Cmdable的二次封装，这个Client主要是用来加锁。
 
+```go
+//Client 用于加锁
+type Client struct {
+   client redis.Cmdable
+}
+```
+
 Client有TryLock(ctx,key,expiration)(*Lock,error),setNX如果不ok代表的是别人抢到了锁，成功的话肯定会返回一个Lock之类的东西，所以也定义一个Lock。
 
-Unlock定义在Client不够优雅，应该定义在Lock上这样TryLock返回的Lock就可以直接调用Unlock，如果定义在client上在unlock参数中也不能传key。
+```go
+//TryLock 传入上下文，key和过期时间，返回一个Lock，即锁
+func(c *Client)TryLock(ctx context.Context,key string,expiration time.Duration)(*Lock,error){
+   val:=uuid.New().String()
+   ok,err:=c.client.SetNX(ctx,key,val,expiration).Result()
+   if err!=nil{
+      return nil, err
+   }
+   if !ok{
+      return nil, errFailToPreemptLock
+   }
+   return &Lock{
+      client: c.client,
+      key: key,
+      value: val,
+   }, nil
+}
+```
+
+Unlock定义在Client不够优雅，应该定义在Lock上这样TryLock返回的Lock就可以直接调用Unlock，如果定义在client上在unlock参数中也不能传key，只能传Lock。
+
+```go
+//Lock 代表锁
+type Lock struct {
+   client redis.Cmdable
+   key string
+   value string//用来校对是否是自己的锁
+}
+```
 
 Unlock放在Lock上那么Lock就需要持有redis.Cmdable和key来把键值对删掉。如果删除时，cnt!=1代表锁过期了或者有其他错误。
 
+```go
+//Unlock Lock删除key以释放锁
+func(l *Lock)Unlock(ctx context.Context)error{
+   //检查锁是否是自己的
+   val,err:=l.client.Get(ctx,l.key).Result()
+   if err!=nil{
+      return err
+   }
+   if val!=l.value{
+      return errors.New("不是自己的锁")
+   }
+   //上面check，下面do something,在中间这里的空缺，键值对就可能被删除了
+   cnt,err:=l.client.Del(ctx,l.key).Result()
+   if err!=nil{
+      return err
+   }
+   if cnt!=1{
+      return errLockNotExist
+   }
+   return nil
+}
+```
+
 ###### 为什么要有过期时间
 
-如果没有过期时间，那么原本加锁的实例崩溃后，永远没有人去释放锁。如果业务执行超过了锁的过期时间又怎么办？
+如果没有过期时间，那么原本加锁的实例崩溃后，永远没有人去释放锁。如果业务执行超过了锁的过期时间又怎么办？那么就要判断是否是自己的锁，就要用uuid作为值
 
 ###### 为什么用uuid作为值
 
@@ -2375,6 +2433,180 @@ Unlock放在Lock上那么Lock就需要持有redis.Cmdable和key来把键值对�
 
 那么Unlock的实现就是先判断锁是不是自己的，就是从redis中get key利用uuid来判断，然后把键值对删除掉。但是在判断之后，删除掉之前，此键值对可能就被别的键值对给删除了，紧接着另外一个实例加锁。也就是说中间这里有一小段时间空缺，所以需要进行原子操作，让get到del中不能有人插入，所以就需要lua脚本。用lua脚本来替代上述操作。使用redis的eval，其中的lua语句参数可以在外面写完lua脚本后，使用go embed来嵌入进一个变量。
 
+```go
+//go:embed lua/unlock.lua
+luaUnlock string
+func(l *Lock)Unlock(ctx context.Context)error{
+	res,err:=l.client.Eval(ctx,luaUnlock,[]string{l.key},l.value).Int64()//结果直接转化成int64，因为del返回的就是删除的个数
+	if err!=nil{
+		return err
+	}
+	if res!=1{
+		return errLockNotExist
+	}
+	return nil
+}
+```
+
 ###### lua脚本
 
 Lua脚本运行期间，为了避免被其他操作污染数据，这期间将不能执行其它命令，一直等到执行完毕才可以继续执行其它请求。当Lua脚本执行时间超过了lua-time-limit时，其他请求将会收到Busy错误，除非这些请求是SCRIPT KILL（杀掉脚本）或者SHUTDOWN NOSAVE（不保存结果直接关闭Redis）。
+
+```lua
+--1. 检查是不是你的锁
+--2. 删除
+-- KEYS[1] 就是你的分布式锁的key
+-- ARGV[1] 就是你预期的存在redis 里面的 value
+if redis.call('get',KEYS[1])==ARGV[1] then
+    --确实是你的锁
+    return redis.call('del',KEYS[1])
+else
+    return 0
+end
+```
+
+###### TryLock和Unlock的单元测试
+
+```go
+func TestClient_TryLock(t *testing.T) {
+   testCases:=[]struct{
+      name string
+      mock func(ctrl *gomock.Controller)redis.Cmdable
+      key string
+      expiration time.Duration
+      wantErr error
+      wantVal *Lock
+   }{
+      {
+         name:       "set nx error",
+         mock: func(ctrl *gomock.Controller) redis.Cmdable {
+            cmd:=mocks.NewMockCmdable(ctrl)
+            //setNx返回的就是Bool
+            res:=redis.NewBoolResult(false,context.DeadlineExceeded)
+            cmd.EXPECT().SetNX(context.Background(),"key1",gomock.Any(),time.Second).Return(res)
+            return cmd
+         },
+         key:        "key1",
+         expiration: time.Second,
+         wantErr:    context.DeadlineExceeded,
+      },
+      {
+         name:       "fail to preempt lock",
+         mock: func(ctrl *gomock.Controller) redis.Cmdable {
+            cmd:=mocks.NewMockCmdable(ctrl)
+            res:=redis.NewBoolResult(false,errFailToPreemptLock)
+            cmd.EXPECT().SetNX(context.Background(),"key1",gomock.Any(),time.Second).Return(res)
+            return cmd
+         },
+         key:        "key1",
+         expiration: time.Second,
+         wantErr:    errFailToPreemptLock,
+      },
+      {
+         name:       "lock",
+         mock: func(ctrl *gomock.Controller) redis.Cmdable {
+            cmd:=mocks.NewMockCmdable(ctrl)
+            res:=redis.NewBoolResult(true,nil)
+            cmd.EXPECT().SetNX(context.Background(),"key1",gomock.Any(),time.Second).Return(res)
+            return cmd
+         },
+         key:        "key1",
+         expiration: time.Second,
+         wantVal: &Lock{
+            key:    "key1",
+            expiration: time.Second,
+         },
+      },
+   }
+
+   for _,tc:=range testCases{
+      t.Run(tc.name, func(t *testing.T) {
+         ctrl:=gomock.NewController(t)
+         defer ctrl.Finish()
+         lock,err:=NewClient(tc.mock(ctrl)).TryLock(context.Background(),tc.key,tc.expiration)
+         assert.Equal(t, tc.wantErr,err)
+         if err!=nil{
+            return
+         }
+         assert.Equal(t,tc.wantVal.key,lock.key)
+         //无法得到准确的value只能通过判断是否有值做粗略的检查
+         assert.NotEmpty(t, lock.value)
+      })
+   }
+}
+
+func TestLock_Unlock(t *testing.T) {
+   //在测试用例中使用Lock，那么里面的client就需要ctrl，只能定义一个总的ctrl来复用
+   //可以使用下面的定义，这样就可以在每个测试用例中单独创建ctrl，再把lock创建起来即可
+   //testCases := []struct{
+   // name string
+   // mock func(ctrl *gomock.Controller) redis.Cmdable
+   // key string
+   // value string
+   // wantErr error
+   //}
+   ctrl:=gomock.NewController(t)
+   testCases:=[]struct{
+      name string
+      lock *Lock
+      wantErr error
+   }{
+      {
+         name:    "unlock err",
+         lock:    &Lock{
+            client:     func(ctrl *gomock.Controller)redis.Cmdable{
+               cmd:=mocks.NewMockCmdable(ctrl)
+               res:=redis.NewCmd(context.Background())
+               res.SetErr(context.DeadlineExceeded)
+               cmd.EXPECT().Eval(context.Background(),luaUnlock,[]string{"key"},"value").Return(res)
+               return cmd
+            }(ctrl),
+            key:        "key",
+            value:      "value",
+            expiration: time.Second,
+         },
+         wantErr: context.DeadlineExceeded,
+      },
+      {
+         name:    "lock not hold",
+         lock:    &Lock{
+            client:     func(ctrl *gomock.Controller)redis.Cmdable{
+               cmd:=mocks.NewMockCmdable(ctrl)
+               res:=redis.NewCmd(context.Background())
+               res.SetVal(int64(0))
+               cmd.EXPECT().Eval(context.Background(),luaUnlock,[]string{"key"},"value").Return(res)
+               return cmd
+            }(ctrl),
+            key:        "key",
+            value:      "value",
+            expiration: time.Second,
+         },
+         wantErr: errLockNotHold,
+      },
+      {
+         name:    "unlock",
+         lock:    &Lock{
+            client:     func(ctrl *gomock.Controller)redis.Cmdable{
+               cmd:=mocks.NewMockCmdable(ctrl)
+               res:=redis.NewCmd(context.Background())
+               res.SetVal(int64(1))
+               cmd.EXPECT().Eval(context.Background(),luaUnlock,[]string{"key"},"value").Return(res)
+               return cmd
+            }(ctrl),
+            key:        "key",
+            value:      "value",
+            expiration: time.Second,
+         },
+      },
+   }
+   for _,tc:=range testCases{
+      t.Run(tc.name, func(t *testing.T) {
+         err:=tc.lock.Unlock(context.Background())
+         assert.Equal(t, tc.wantErr,err)
+         if err!=nil{
+            return
+         }
+      })
+   }
+}
+```

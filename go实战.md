@@ -2610,3 +2610,17 @@ func TestLock_Unlock(t *testing.T) {
    }
 }
 ```
+
+###### 集成测试
+
+集成测试需要连上实际redis，先创建一个redis客户端。
+
+trylock的err是比较难测的，setNx不成功，和成功后返回的Lock才是要测的。
+
+别人抢到了锁，说明已经有一个key了，在测试用例中最好有一个before的func(t *testing.T)来模拟别人有锁，手动的塞一个key进去。
+
+那我怎么知道redis的值设对了，设置一个after使用getdel来得到值来判断。
+
+unlock需要测没有锁，别人持有所，自己有锁的情况。
+
+因为在每个before，after数据都不一样，所以不适合testsuite的beforetest和aftertest

@@ -92,8 +92,8 @@ func TestNewBuildInMapCacheTicker(t *testing.T) {
 	require.NoError(t, err)
 	err = c.Set(context.Background(), "key4", 123, time.Second)
 	require.NoError(t, err)
-	time.Sleep(time.Second * 1)
-	require.Equal(t, 3, cnt)
+	time.Sleep(time.Second * 2)
+	require.Equal(t, 4, cnt)
 }
 
 func TestBuildInMapCache_Close(t *testing.T) {

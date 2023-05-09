@@ -177,7 +177,7 @@ func(r *registry)get(val any)(*model,error){
 
 事务由DB开启，方法定义在DB上，Commit和Rollback由Tx来决定。而将Begin定义在DB上就限制了在一个事务无法开启一个新事务。
 
-![image-20230328073532423](C:\Users\123456\AppData\Roaming\Typora\typora-user-images\image-20230328073532423.png)
+![image-20230328073532423](C:\Users\123456\OneDrive\图片\go笔记\事务.png)
 
 Tx的使用：原本Selector接收的是DB做参数，现在使它也可以接收Tx，因为可以在事务中运行(Tx)也可以无事务运行(DB)，那么就需要一个共同的抽象，让DB和Tx来实现。
 
@@ -2615,7 +2615,7 @@ func TestLock_Unlock(t *testing.T) {
 
 集成测试需要连上实际redis，先创建一个redis客户端。
 
-trylock的err是比较难测的，setNx不成功，和成功后返回的Lock才是要测的。
+trylock的err是比较难测的，那么setNx不成功，和成功后返回的Lock才是要测的。
 
 别人抢到了锁，说明已经有一个key了，在测试用例中最好有一个before的func(t *testing.T)来模拟别人有锁，手动的塞一个key进去。
 
@@ -2624,3 +2624,558 @@ trylock的err是比较难测的，setNx不成功，和成功后返回的Lock才�
 unlock需要测没有锁，别人持有所，自己有锁的情况。
 
 因为在每个before，after数据都不一样，所以不适合testsuite的beforetest和aftertest
+
+```go
+func TestClient_TryLock2(t *testing.T) {
+   //before和after都要使用，所以放到外面
+   rdb:=NewClient(redis.NewClient(&redis.Options{Addr: "localhost:6379"}))
+   testCases:=[]struct{
+      name string
+      before func(t *testing.T)
+      after func(t *testing.T)
+      key string
+      expiration time.Duration
+      wantErr  error
+      wantLock *Lock
+   }{
+      {
+         name:       "locked",
+         before: func(t *testing.T) {
+            _,err:=rdb.client.SetNX(context.Background(),"key1","value1",time.Second*10).Result()
+            if err!=nil{
+               return
+            }
+         },
+         after: func(t *testing.T) {
+            res,err:=rdb.client.GetDel(context.Background(),"key1").Result()
+            require.NoError(t, err)
+            require.Equal(t, "value1",res)
+         },
+         key:        "key1",
+         expiration: time.Second*10,
+         wantErr:    errFailToPreemptLock,
+      },
+      {
+         name:       "set lock",
+         before: func(t *testing.T) {},
+         after: func(t *testing.T) {
+            _,err:=rdb.client.Del(context.Background(),"key2").Result()
+            require.NoError(t, err)
+         },
+         key:        "key2",
+         expiration: time.Second*10,
+         wantLock:    &Lock{
+            client:     rdb.client,
+            key:        "key2",
+            expiration: time.Second*10,
+         },
+      },
+   }
+   for _,tc:=range testCases{
+      t.Run(tc.name, func(t *testing.T) {
+         tc.before(t)
+         ctx,cancel:=context.WithTimeout(context.Background(),time.Second*10)
+         defer cancel()
+         lock,err:=rdb.TryLock(ctx,tc.key,tc.expiration)
+         assert.Equal(t, tc.wantErr,err)
+         if err!=nil{
+            return
+         }
+         assert.Equal(t, tc.wantLock.key,lock.key)
+         assert.NotEmpty(t, lock.value)
+         tc.after(t)
+      })
+   }
+}
+
+func TestLock_Unlock2(t *testing.T) {
+   //before和after都要使用，所以放到外面
+   rdb:=NewClient(redis.NewClient(&redis.Options{Addr: "localhost:6379"}))
+   testCases:=[]struct{
+      name string
+      lock *Lock
+      before func(t *testing.T)
+      after func(t *testing.T)
+      wantErr error
+
+   }{
+      {
+         name:    "no locked",
+         lock:    &Lock{
+            client:     rdb.client,
+            key:        "unlock_key1",
+         },
+         before:  func(t *testing.T){},
+         after:   func(t *testing.T){},
+         wantErr: errLockNotHold,
+      },
+      {
+         name:    "other has locked",
+         lock:    &Lock{
+            client:     rdb.client,
+            key:        "unlock_key2",
+            value: "unlock_value",
+         },
+         before:  func(t *testing.T){
+            _,err:=rdb.client.SetNX(context.Background(),"unlock_key2","unlock_value2",time.Second*10).Result()
+            require.NoError(t, err)
+            if err!=nil{
+               return
+            }
+         },
+         after:   func(t *testing.T){
+            res,err:=rdb.client.GetDel(context.Background(),"unlock_key2").Result()
+            require.NoError(t, err)
+            require.Equal(t, "unlock_value2",res)
+         },
+         wantErr: errLockNotHold,
+      },
+      {
+         name:    "unlocked",
+         lock:    &Lock{
+            client:     rdb.client,
+            key:        "unlock_key3",
+            value: "unlock_value3",
+         },
+         before:  func(t *testing.T){
+            _,err:=rdb.client.SetNX(context.Background(),"unlock_key3","unlock_value3",time.Second*10).Result()
+            require.NoError(t, err)
+            if err!=nil{
+               return
+            }
+         },
+         after:   func(t *testing.T){
+         },
+      },
+   }
+   for _,tc:=range testCases{
+      t.Run(tc.name, func(t *testing.T) {
+         tc.before(t)
+         ctx,cancel:=context.WithTimeout(context.Background(),time.Second*10)
+         defer cancel()
+         err:=tc.lock.Unlock(ctx)
+         assert.Equal(t, tc.wantErr,err)
+         if err!=nil{
+            return
+         }
+         tc.after(t)
+      })
+   }
+```
+
+###### 踩坑
+
+集成测试中的before,after即使不做动作也不能设置为nil，不然会出现空指针panic。
+
+##### 续约与自动续约
+
+###### 过期时间
+
+对锁的用户来说，很难确定锁的过期时间应该设置多长：
+
++ 短了，业务还没完成，锁就过期
++ 长了，万一实例崩溃了，那么其它实例也长时间拿不到锁
+
+更严重的，不管设置多长，极端情况下，都会出现业务执行时间超过过期时间。
+
+###### 续约
+
+在锁还没过期时，再次延长锁的过期时间。
+
++ 过期时间不必设置过长，因为有自动续约
++ 如果实例崩溃，则没有人再续约，过一段时间后就会过期，其它实例就能拿到锁
+
+###### 实现
+
+依旧要使用lua脚本，因为在refresh时也要判断一下是不是自己的锁，防止续约错了锁。redis的命令就是expire
+
+expire key time [NX|XX...]
+
+```lua
+--1. 检查是不是你的锁
+--2. 刷新
+-- KEYS[1] 就是你的分布式锁的key
+-- ARGV[1] 就是你预期的存在redis 里面的 value
+if redis.call('get',KEYS[1])==ARGV[1] then
+    --确实是你的锁
+    return redis.call('expire',KEYS[1],ARGV[2])
+else
+    return 0
+end
+```
+
+基本就是unlock，然后把lua变量和脚本更换,续约的时间就可以使用我们创建的时候使用的过期时间，所以Lock中就可以加上expiration来使用。
+
+```go
+//Lock 代表锁
+type Lock struct {
+   client     redis.Cmdable
+   key        string
+   value      string
+   expiration time.Duration
+}
+	//go:embed lua/refresh.lua
+	luaRefresh string
+func (l *Lock) Refresh(ctx context.Context) error {
+	res, err := l.client.Eval(ctx, luaRefresh, []string{l.key}, l.value,l.expiration.Seconds()).Int64()
+	if err != nil {
+		return err
+	}
+	if res != 1 {
+		return errLockNotHold
+	}
+	return nil
+}
+```
+
+###### 单元测试
+
+跟unlock的单元测试是很像的，所以把unlock的单元测试改一改就可以了。测试的refresh新增的expiration要是float64(秒)。
+
+```go
+func TestLock_Refresh(t *testing.T) {
+   ctrl := gomock.NewController(t)
+   testCases := []struct {
+      name    string
+      lock    *Lock
+      expiration time.Duration
+      wantErr error
+   }{
+      {
+         name: "refresh err",
+         lock: &Lock{
+            client: func(ctrl *gomock.Controller) redis.Cmdable {
+               cmd := mocks.NewMockCmdable(ctrl)
+               res := redis.NewCmd(context.Background())
+               res.SetErr(context.DeadlineExceeded)
+               cmd.EXPECT().Eval(context.Background(), luaRefresh, []string{"key"}, "value",float64(1)).Return(res)
+               return cmd
+            }(ctrl),
+            key:        "key",
+            value:      "value",
+            expiration: time.Second,
+         },
+         wantErr: context.DeadlineExceeded,
+         expiration: time.Second,
+      },
+      {
+         name: "lock not hold",
+         lock: &Lock{
+            client: func(ctrl *gomock.Controller) redis.Cmdable {
+               cmd := mocks.NewMockCmdable(ctrl)
+               res := redis.NewCmd(context.Background())
+               res.SetVal(int64(0))
+               cmd.EXPECT().Eval(context.Background(), luaRefresh, []string{"key"}, "value",float64(1)).Return(res)
+               return cmd
+            }(ctrl),
+            key:        "key",
+            value:      "value",
+            expiration: time.Second,
+         },
+         wantErr: errLockNotHold,
+         expiration: time.Second,
+      },
+      {
+         name: "Refresh",
+         lock: &Lock{
+            client: func(ctrl *gomock.Controller) redis.Cmdable {
+               cmd := mocks.NewMockCmdable(ctrl)
+               res := redis.NewCmd(context.Background())
+               res.SetVal(int64(1))
+               cmd.EXPECT().Eval(context.Background(), luaRefresh, []string{"key"}, "value",float64(1)).Return(res)
+               return cmd
+            }(ctrl),
+            key:        "key",
+            value:      "value",
+            expiration: time.Second,
+         },
+         expiration: time.Second,
+      },
+   }
+   for _, tc := range testCases {
+      t.Run(tc.name, func(t *testing.T) {
+         err := tc.lock.Refresh(context.Background())
+         assert.Equal(t, tc.wantErr, err)
+         if err != nil {
+            return
+         }
+      })
+   }
+}
+```
+
+但是如何检测刷新成功？
+
+在单元测试层面上是检测不出来的，只能在集成测试的实际环境检测。
+
+###### 集成测试
+
+在after中使用TTL,这会返回一个time.Duration,得到时间后使用require.True(t,timeout<=新设置的expiration)，这样测试就是把原本的expiration设置为1分钟，新set的设置为10s，即使考虑测试本身的运行时间，那么timeout肯定还是大于10s的。这样就可以验证刷新失败。
+
+```go
+func TestLock_Refresh2(t *testing.T) {
+   //before和after都要使用，所以放到外面
+   rdb := NewClient(redis.NewClient(&redis.Options{Addr: "localhost:6379"}))
+   testCases := []struct {
+      name    string
+      lock    *Lock
+      before  func(t *testing.T)
+      after   func(t *testing.T)
+      wantErr error
+   }{
+      {
+         name: "no locked",
+         lock: &Lock{
+            client: rdb.client,
+            key:    "unlock_key1",
+            expiration: time.Second,
+         },
+         before:  func(t *testing.T) {},
+         after:   func(t *testing.T) {},
+         wantErr: errLockNotHold,
+      },
+      {
+         name: "other has locked",
+         lock: &Lock{
+            client: rdb.client,
+            key:    "unlock_key2",
+            value:  "unlock_value",
+            expiration: time.Second*10,
+         },
+         before: func(t *testing.T) {
+            _, err := rdb.client.SetNX(context.Background(), "unlock_key2", "unlock_value2", time.Second*10).Result()
+            require.NoError(t, err)
+            if err != nil {
+               return
+            }
+         },
+         after: func(t *testing.T) {
+            ctx,cancel:=context.WithTimeout(context.Background(),time.Second*3)
+            defer cancel()
+            timeout,err:=rdb.client.TTL(ctx,"unlock_key2").Result()
+            require.NoError(t, err)
+            require.True(t, timeout<time.Second*10)
+            res, err := rdb.client.GetDel(context.Background(), "unlock_key2").Result()
+            require.NoError(t, err)
+            require.Equal(t, "unlock_value2", res)
+         },
+         wantErr: errLockNotHold,
+      },
+      {
+         name: "Refresh",
+         lock: &Lock{
+            client: rdb.client,
+            key:    "unlock_key3",
+            value:  "unlock_value3",
+            expiration: time.Minute,
+         },
+         before: func(t *testing.T) {
+            _, err := rdb.client.SetNX(context.Background(), "unlock_key3", "unlock_value3", time.Minute).Result()
+            require.NoError(t, err)
+            if err != nil {
+               return
+            }
+         },
+         after: func(t *testing.T) {
+            ctx,cancel:=context.WithTimeout(context.Background(),time.Second*3)
+            defer cancel()
+            timeout,err:=rdb.client.TTL(ctx,"unlock_key3").Result()
+            require.NoError(t, err)
+            // 如果要是刷新成功了，过期时间是一分钟，即便考虑测试本身的运行时间，timeout > 10s
+            require.True(t, timeout>time.Second*50)
+            _,err=rdb.client.Del(ctx,"unlock_key3").Result()
+            require.NoError(t, err)
+         },
+      },
+   }
+   for _, tc := range testCases {
+      t.Run(tc.name, func(t *testing.T) {
+         tc.before(t)
+         ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+         defer cancel()
+         err := tc.lock.Refresh(ctx)
+         assert.Equal(t, tc.wantErr, err)
+         if err != nil {
+            return
+         }
+         tc.after(t)
+      })
+   }
+}
+```
+
+###### 手动续约：如何使用refresh方法
+
+业务方使用起来很复杂。
+
+使用Example来进行测试。基本上就是新开一个goroutine来使用ticker进行refresh，那么问题就是ctx怎么传，可以使用一个withTimeout设置一个一秒钟的ctx。
+
+问题1：refresh error怎么办
+
+error那么goroutine就需要向业务发信号，那只能设置一个error类型的errorChannel来进行通信，在业务执行的过程中要记得检测errChan有没有信号。如果是循环的业务代码，那么可以用select，但如果不是循环的，那只能在每个步骤都用select检测一下。
+
+问题2：如何终止续约
+
+只能是设置一个channel，使用select case来判断
+
+问题3 ：有些错误是可以挽回的
+
+比如说超时，那么就可以设置一个timeoutChan,在case <-ticker.C中就可以判断超时，超时就可以再次进行续约操作。
+
+```go
+func ExampleLock_Refresh() {
+   //加锁成功
+   var l *Lock
+   //终止续约的channel
+   stopChan:=make(chan struct{})
+   //出现错误的channel
+   errChan:=make(chan error)
+   //可以挽回的error 比如超时的error chan,放入值后需要继续运行，所以设置缓冲为1
+   timeoutChan:=make(chan struct{},1)
+   //一个goroutine用来续约
+   go func() {
+      ticker:=time.NewTicker(time.Second*10)
+      for{
+         select {
+         case <-ticker.C:
+            ctx,cancel:=context.WithTimeout(context.Background(),time.Second)
+            err:=l.Refresh(ctx)
+            cancel()
+            if err==context.DeadlineExceeded{
+               timeoutChan<- struct{}{}
+               continue
+            }
+            if err!=nil{
+               errChan<-err
+               //自己选择在哪close
+               //close(stopChan)
+               //close(errChan)
+               return
+            }
+         case <-timeoutChan:
+            ctx,cancel:=context.WithTimeout(context.Background(),time.Second)
+            err:=l.Refresh(ctx)
+            cancel()
+            if err==context.DeadlineExceeded{
+               timeoutChan<- struct{}{}
+            }
+            if err!=nil{
+               return
+            }
+         case <-stopChan:
+            return
+         }
+      }
+
+   }()
+   //执行业务
+   //在业务执行过程中检测error
+   //循环中的业务
+   for i := 0; i < 100; i++ {
+      select {
+      //续约失败
+      case <-errChan:
+         break
+      default:
+         //正常业务逻辑
+      }
+   }
+   //非循环的业务
+   //只能每个步骤都要检测error
+   select {
+   case err:=<-errChan:
+      log.Fatalln(err)
+      return
+   default:
+      //业务步骤1
+   }
+   select {
+   case err:=<-stopChan:
+      log.Fatalln(err)
+      return
+   default:
+      //业务步骤2
+   }
+   //执行完业务，终止续约
+   stopChan<- struct{}{}
+   // l.Unlock(context.Background())
+}
+```
+
+###### 自动续约
+
+因为用户手动续约很繁琐，处理分布式锁的各种异常是一个很棘手的事情，可以考虑提供自动续约的API。
+
+问题基本和手动续约一样：
+
++ 隔多久续约，续多长？多久续约一次跟网络，redis服务器稳定性有关，每次续多长就直接使用原本的过期时间。
++ 如何处理超时，以及超时设置多长时间？由于超时一般是偶发性错误，可以立刻重新进行续约，超时时间让用户指定
++ 如何通知用户续约失败？只处理超时引起的失败，其他error通知用户
++ 要不要设置续约次数上限？不需要，用户自己决定
+
+###### 自动续约实现
+
+在lock上定义一个autorefresh(interval,timeout)error,就是使用手动续约的example的goroutine中的代码，还需要一些修改。
+
+stopChan,由于是在goroutine外定义，goroutine内使用，现在不使用goroutine，那么可以在lock中加上unlockChan,并希望在unlock时把它close掉。
+
+把ticker的时间改为interval，超时设置改为timeout
+
+因为直接返回了error，所以不需要errorChan
+
+```go
+// AutoRefresh 自动续约 传入超时时间
+func(l *Lock)AutoRefresh(interval time.Duration,timeout time.Duration)error{
+   //可以挽回的error 比如超时的error chan,放入值后需要继续运行，所以设置缓冲为1
+   timeoutChan:=make(chan struct{},1)
+   ticker := time.NewTicker(interval)
+   for {
+      select {
+      case <-ticker.C:
+         ctx, cancel := context.WithTimeout(context.Background(), timeout)
+         err := l.Refresh(ctx)
+         cancel()
+         if err == context.DeadlineExceeded {
+            timeoutChan <- struct{}{}
+            continue
+         }
+         if err != nil {
+            return err
+         }
+      case <-timeoutChan:
+         ctx, cancel := context.WithTimeout(context.Background(), timeout)
+         err := l.Refresh(ctx)
+         cancel()
+         if err == context.DeadlineExceeded {
+            timeoutChan <- struct{}{}
+         }
+         if err != nil {
+            return err
+         }
+      case <-l.unlockCh:
+         return nil
+      }
+   }
+}
+func (l *Lock) Unlock(ctx context.Context) error {
+	res, err := l.client.Eval(ctx, luaUnlock, []string{l.key}, l.value).Int64()
+	defer func() {
+		select {
+		case l.unlockCh<- struct{}{}:
+		default:
+			//说明没有人调用AutoRefresh
+		}
+	}()
+	if err != nil {
+		return err
+	}
+	if res != 1 {
+		return errLockNotHold
+	}
+	return nil
+}
+```
+
+自动续约可控性很差，所以即使提供了API也不提倡使用，如果用户想要 万无一失的使用这个分布式锁，那还是要手动调用refresh然后处理各种error。
+
+此外，续约的间隔应该综合考虑服务可用性，如果将分布式锁的过期时间设置为10s，而且预期2s内大概率续约成功，那么就可以将续约间隔设为8s。

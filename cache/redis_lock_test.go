@@ -6,6 +6,7 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"gotest/cache/mocks"
+	"log"
 	"testing"
 	"time"
 )
@@ -150,4 +151,151 @@ func TestLock_Unlock(t *testing.T) {
 			}
 		})
 	}
+}
+func TestLock_Refresh(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	testCases := []struct {
+		name       string
+		lock       *Lock
+		expiration time.Duration
+		wantErr    error
+	}{
+		{
+			name: "refresh err",
+			lock: &Lock{
+				client: func(ctrl *gomock.Controller) redis.Cmdable {
+					cmd := mocks.NewMockCmdable(ctrl)
+					res := redis.NewCmd(context.Background())
+					res.SetErr(context.DeadlineExceeded)
+					cmd.EXPECT().Eval(context.Background(), luaRefresh, []string{"key"}, "value", float64(1)).Return(res)
+					return cmd
+				}(ctrl),
+				key:        "key",
+				value:      "value",
+				expiration: time.Second,
+			},
+			wantErr:    context.DeadlineExceeded,
+			expiration: time.Second,
+		},
+		{
+			name: "lock not hold",
+			lock: &Lock{
+				client: func(ctrl *gomock.Controller) redis.Cmdable {
+					cmd := mocks.NewMockCmdable(ctrl)
+					res := redis.NewCmd(context.Background())
+					res.SetVal(int64(0))
+					cmd.EXPECT().Eval(context.Background(), luaRefresh, []string{"key"}, "value", float64(1)).Return(res)
+					return cmd
+				}(ctrl),
+				key:        "key",
+				value:      "value",
+				expiration: time.Second,
+			},
+			wantErr:    errLockNotHold,
+			expiration: time.Second,
+		},
+		{
+			name: "Refresh",
+			lock: &Lock{
+				client: func(ctrl *gomock.Controller) redis.Cmdable {
+					cmd := mocks.NewMockCmdable(ctrl)
+					res := redis.NewCmd(context.Background())
+					res.SetVal(int64(1))
+					cmd.EXPECT().Eval(context.Background(), luaRefresh, []string{"key"}, "value", float64(1)).Return(res)
+					return cmd
+				}(ctrl),
+				key:        "key",
+				value:      "value",
+				expiration: time.Second,
+			},
+			expiration: time.Second,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.lock.Refresh(context.Background())
+			assert.Equal(t, tc.wantErr, err)
+			if err != nil {
+				return
+			}
+		})
+	}
+}
+
+func ExampleLock_Refresh() {
+	//加锁成功
+	var l *Lock
+	//终止续约的channel
+	stopChan := make(chan struct{})
+	//出现错误的channel
+	errChan := make(chan error)
+	//可以挽回的error 比如超时的error chan,放入值后需要继续运行，所以设置缓冲为1
+	timeoutChan := make(chan struct{}, 1)
+	//一个goroutine用来续约
+	go func() {
+		ticker := time.NewTicker(time.Second * 10)
+		for {
+			select {
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				err := l.Refresh(ctx)
+				cancel()
+				if err == context.DeadlineExceeded {
+					timeoutChan <- struct{}{}
+					continue
+				}
+				if err != nil {
+					errChan <- err
+					//自己选择在哪close
+					//close(stopChan)
+					//close(errChan)
+					return
+				}
+			case <-timeoutChan:
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				err := l.Refresh(ctx)
+				cancel()
+				if err == context.DeadlineExceeded {
+					timeoutChan <- struct{}{}
+				}
+				if err != nil {
+					return
+				}
+			case <-stopChan:
+				return
+			}
+		}
+
+	}()
+	//执行业务
+	//在业务执行过程中检测error
+	//循环中的业务
+	for i := 0; i < 100; i++ {
+		select {
+		//续约失败
+		case <-errChan:
+			break
+		default:
+			//正常业务逻辑
+		}
+	}
+	//非循环的业务
+	//只能每个步骤都要检测error
+	select {
+	case err := <-errChan:
+		log.Fatalln(err)
+		return
+	default:
+		//业务步骤1
+	}
+	select {
+	case err := <-stopChan:
+		log.Fatalln(err)
+		return
+	default:
+		//业务步骤2
+	}
+	//执行完业务，终止续约
+	stopChan <- struct{}{}
+	// l.Unlock(context.Background())
 }

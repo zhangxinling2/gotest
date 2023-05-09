@@ -7,6 +7,7 @@ import (
 	"github.com/go-redis/redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"log"
 	"testing"
 	"time"
 )
@@ -138,6 +139,95 @@ func TestLock_Unlock2(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 			defer cancel()
 			err := tc.lock.Unlock(ctx)
+			assert.Equal(t, tc.wantErr, err)
+			if err != nil {
+				return
+			}
+			tc.after(t)
+		})
+	}
+}
+func TestLock_Refresh2(t *testing.T) {
+	//before和after都要使用，所以放到外面
+	rdb := NewClient(redis.NewClient(&redis.Options{Addr: "localhost:6379"}))
+	testCases := []struct {
+		name    string
+		lock    *Lock
+		before  func(t *testing.T)
+		after   func(t *testing.T)
+		wantErr error
+	}{
+		{
+			name: "no locked",
+			lock: &Lock{
+				client:     rdb.client,
+				key:        "unlock_key1",
+				expiration: time.Second,
+			},
+			before:  func(t *testing.T) {},
+			after:   func(t *testing.T) {},
+			wantErr: errLockNotHold,
+		},
+		{
+			name: "other has locked",
+			lock: &Lock{
+				client:     rdb.client,
+				key:        "unlock_key2",
+				value:      "unlock_value",
+				expiration: time.Second * 10,
+			},
+			before: func(t *testing.T) {
+				_, err := rdb.client.SetNX(context.Background(), "unlock_key2", "unlock_value2", time.Second*10).Result()
+				require.NoError(t, err)
+				if err != nil {
+					return
+				}
+			},
+			after: func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+				defer cancel()
+				timeout, err := rdb.client.TTL(ctx, "unlock_key2").Result()
+				require.NoError(t, err)
+				require.True(t, timeout < time.Second*10)
+				res, err := rdb.client.GetDel(context.Background(), "unlock_key2").Result()
+				require.NoError(t, err)
+				require.Equal(t, "unlock_value2", res)
+			},
+			wantErr: errLockNotHold,
+		},
+		{
+			name: "Refresh",
+			lock: &Lock{
+				client:     rdb.client,
+				key:        "unlock_key3",
+				value:      "unlock_value3",
+				expiration: time.Minute,
+			},
+			before: func(t *testing.T) {
+				_, err := rdb.client.SetNX(context.Background(), "unlock_key3", "unlock_value3", time.Minute).Result()
+				require.NoError(t, err)
+				if err != nil {
+					return
+				}
+			},
+			after: func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+				defer cancel()
+				timeout, err := rdb.client.TTL(ctx, "unlock_key3").Result()
+				require.NoError(t, err)
+				// 如果要是刷新成功了，过期时间是一分钟，即便考虑测试本身的运行时间，timeout > 10s
+				require.True(t, timeout > time.Second*50)
+				_, err = rdb.client.Del(ctx, "unlock_key3").Result()
+				require.NoError(t, err)
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.before(t)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			err := tc.lock.Refresh(ctx)
 			assert.Equal(t, tc.wantErr, err)
 			if err != nil {
 				return

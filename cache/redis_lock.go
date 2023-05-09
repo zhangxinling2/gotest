@@ -15,6 +15,8 @@ var (
 
 	//go:embed lua/unlock.lua
 	luaUnlock string
+	//go:embed lua/refresh.lua
+	luaRefresh string
 )
 
 //Client 用于加锁
@@ -49,10 +51,62 @@ type Lock struct {
 	key        string
 	value      string
 	expiration time.Duration
+	unlockCh   chan struct{}
 }
 
+// AutoRefresh 自动续约 传入超时时间
+func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error {
+	//可以挽回的error 比如超时的error chan,放入值后需要继续运行，所以设置缓冲为1
+	timeoutChan := make(chan struct{}, 1)
+	ticker := time.NewTicker(interval)
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := l.Refresh(ctx)
+			cancel()
+			if err == context.DeadlineExceeded {
+				timeoutChan <- struct{}{}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		case <-timeoutChan:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := l.Refresh(ctx)
+			cancel()
+			if err == context.DeadlineExceeded {
+				timeoutChan <- struct{}{}
+			}
+			if err != nil {
+				return err
+			}
+		case <-l.unlockCh:
+			return nil
+		}
+	}
+}
 func (l *Lock) Unlock(ctx context.Context) error {
 	res, err := l.client.Eval(ctx, luaUnlock, []string{l.key}, l.value).Int64()
+	defer func() {
+		select {
+		case l.unlockCh <- struct{}{}:
+		default:
+			//说明没有人调用AutoRefresh
+		}
+	}()
+	if err != nil {
+		return err
+	}
+	if res != 1 {
+		return errLockNotHold
+	}
+	return nil
+}
+
+func (l *Lock) Refresh(ctx context.Context) error {
+	res, err := l.client.Eval(ctx, luaRefresh, []string{l.key}, l.value, l.expiration.Seconds()).Int64()
 	if err != nil {
 		return err
 	}

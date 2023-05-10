@@ -10,7 +10,7 @@ import (
 
 // 注意要从命令行启动，否则不同的 IDE 可能会吞掉关闭信号
 func main() {
-	s1 := service.NewServer("business", "localhost:8080")
+	s1 := service.NewServer("business", "localhost:8082")
 	s1.Handle("/", http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		_, _ = writer.Write([]byte("hello"))
 	}))

@@ -4,6 +4,9 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"sync"
 	"time"
 )
 
@@ -19,6 +22,21 @@ type ShutdownCallback func(ctx context.Context)
 func WithShutdownCallbacks(cbs ...ShutdownCallback) Option {
 	return func(app *App) {
 		app.cbs = cbs
+	}
+}
+func AppWithShutdownTimeout(shutdownTimeout time.Duration) Option {
+	return func(app *App) {
+		app.shutdownTimeout = shutdownTimeout
+	}
+}
+func AppWithWaitTimeout(waitTimeout time.Duration) Option {
+	return func(app *App) {
+		app.waitTime = waitTimeout
+	}
+}
+func AppWithCBTimeout(cbTimeout time.Duration) Option {
+	return func(app *App) {
+		app.cbTimeout = cbTimeout
 	}
 }
 
@@ -69,28 +87,89 @@ func (app *App) StartAndServe() {
 	// 从这里开始优雅退出监听系统信号，强制退出以及超时强制退出。
 	// 优雅退出的具体步骤在 shutdown 里面实现
 	// 所以你需要在这里恰当的位置，调用 shutdown
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	<-sig
+	go func() {
+		select {
+		case <-sig:
+			log.Println("再次接收信号，强制退出")
+			os.Exit(1)
+		case <-time.After(app.shutdownTimeout):
+			log.Println("超时，强制退出")
+			os.Exit(1)
+		}
+	}()
+	app.shutdown()
 }
 
 // shutdown 你要设计这里面的执行步骤。
+//http.Server#Shutdown的逻辑是：先关闭所有的 listeners， 然后等待所有的连接（connection）都处理完，再关闭服务。如果传入的 context 超时，则会直接返回。
+//而这个shutdown就实现设计中的五个步骤
 func (app *App) shutdown() {
 	log.Println("开始关闭应用，停止接收新请求")
 	// 你需要在这里让所有的 server 拒绝新请求
+	//在serverMux中设置了reject标记位，所以直接设置每个server的标记位即可
+	for _, ser := range app.servers {
+		ser.rejectReq()
+	}
 
 	log.Println("等待正在执行请求完结")
 	// 在这里等待一段时间
-
-	log.Println("开始关闭服务器")
-	// 并发关闭服务器，同时要注意协调所有的 server 都关闭之后才能步入下一个阶段
+	//设置ctx来控制关闭服务超时时间
+	serverCtx, cancel1 := context.WithTimeout(context.Background(), app.waitTime)
+	defer cancel1()
+	//使用 waitGroup来等待所有的goroutine关闭服务，或者超时才能继续向下执行
+	var wg sync.WaitGroup
+	for _, ser := range app.servers {
+		wg.Add(1)
+		go func(ser *Server, ctx context.Context) {
+			//select {
+			//case <-ctx.Done():
+			//	log.Println("关闭服务超时")
+			//	wg.Done()
+			//	return
+			//default:
+			//	if err := ser.stop(ctx); err != nil {
+			//		log.Println("关闭服务失败")
+			//	}
+			//	wg.Done()
+			//}
+			//使用了http包中的shutdown就直接使用ERROR,就不需要上面这个select
+			if err := ser.stop(ctx); err != nil {
+				log.Println("关闭服务失败,error:", err)
+			}
+			wg.Done()
+		}(ser, serverCtx)
+	}
+	wg.Wait()
 
 	log.Println("开始执行自定义回调")
 	// 并发执行回调，要注意协调所有的回调都执行完才会步入下一个阶段
+	//设置ctx来控制回调超时时间
+	cbsCtx, cancel2 := context.WithTimeout(context.Background(), app.cbTimeout)
+	defer cancel2()
+	wg.Add(len(app.cbs))
+	for _, cb := range app.cbs {
+		callback := cb
+		go func(ctx context.Context) {
+			select {
+			case <-ctx.Done():
+				log.Println("执行回调超时")
+				wg.Done()
+				return
+			default:
+				callback(ctx)
+				wg.Done()
+			}
+		}(cbsCtx)
+	}
+	wg.Wait()
 
 	// 释放资源
 	log.Println("开始释放资源")
-
 	// 这一个步骤不需要你干什么，这是假装我们整个应用自己要释放一些资源
 	app.close()
-	panic("实现前面的步骤")
 }
 
 func (app *App) close() {
@@ -148,8 +227,8 @@ func (s *Server) rejectReq() {
 	s.mux.reject = true
 }
 
+//stop
 func (s *Server) stop(ctx context.Context) error {
-	log.Printf("服务器%s关闭中", s.name)
-	// 在这里模拟停下服务器
-	panic("implement me")
+	//这就是HTTP包中的服务优雅退出，不过我们实现在app下的shutdown中
+	return s.srv.Shutdown(ctx)
 }

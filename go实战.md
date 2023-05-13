@@ -3525,6 +3525,8 @@ lua中使用redis的get得到不存在的值时返回的时false,涉及redis，g
 
 ###### 单元测试
 
+由于重试时有withTimeOut，在mock中根本不可能与实际一模一样，所以会在这里报错，无法测试。
+
 ###### 集成测试
 
 加锁重试重点还是在于跟redis的交互，所以重点还是测的lua脚本的情况。集成测试中ctx超时是比较难测的，在模拟环境中好测，因为正常环境下是比较稳定的，所以正常情况下是不测的。
@@ -3538,6 +3540,94 @@ lua中使用redis的get得到不存在的值时返回的时false,涉及redis，g
 2.别人持有锁，且重试次数超过限制
 
 3.别人持有锁，但在重试时别人释放掉锁
+
+```go
+func TestClient_Lock2(t *testing.T) {
+   rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+   testCases := []struct {
+      name   string
+      key    string
+      before func(t *testing.T)
+      after  func(t *testing.T)
+      //key 过期时间
+      expiration time.Duration
+      //重试间隔
+      timeout time.Duration
+      //重试策略
+      retry    RetryStrategy
+      wantLock *Lock
+      wantErr  error
+   }{
+      {
+         name: "locked",
+         before: func(t *testing.T) {
+         },
+         after: func(t *testing.T) {
+            ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+            defer cancel()
+            timeout, err := rdb.TTL(ctx, "lock_key1").Result()
+            require.NoError(t, err)
+            require.True(t, timeout >= time.Second*50)
+            _, err = rdb.Del(ctx, "lock_key1").Result()
+            require.NoError(t, err)
+         },
+         key:        "lock_key1",
+         expiration: time.Minute,
+         timeout:    time.Second * 2,
+         retry: &FixedIntervalRetryStrategy{
+            Interval: time.Second,
+            MaxCnt:   10,
+         },
+         wantLock: &Lock{
+            key:        "lock_key1",
+            expiration: time.Minute,
+         },
+      },
+      {
+         name: "others hold lock",
+         before: func(t *testing.T) {
+            ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+            defer cancel()
+            res, err := rdb.Set(ctx, "lock_key2", "123", time.Minute).Result()
+            require.NoError(t, err)
+            require.Equal(t, "OK", res)
+         },
+         after: func(t *testing.T) {
+            ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+            defer cancel()
+            res, err := rdb.GetDel(ctx, "lock_key2").Result()
+            require.NoError(t, err)
+            require.Equal(t, "123", res)
+         },
+         key:        "lock_key2",
+         expiration: time.Minute,
+         timeout:    time.Second * 3,
+         retry: &FixedIntervalRetryStrategy{
+            Interval: time.Second,
+            MaxCnt:   3,
+         },
+         wantErr: fmt.Errorf("redis-lock: 超出重试限制, %w", errFailToPreemptLock),
+      },
+   }
+
+   for _, tc := range testCases {
+      t.Run(tc.name, func(t *testing.T) {
+         tc.before(t)
+         client := NewClient(rdb)
+         lock, err := client.Lock(context.Background(), tc.key, tc.expiration, tc.timeout, tc.retry)
+         assert.Equal(t, tc.wantErr, err)
+         if err != nil {
+            return
+         }
+         assert.Equal(t, tc.wantLock.key, lock.key)
+         assert.Equal(t, tc.wantLock.expiration, lock.expiration)
+         assert.NotEmpty(t, lock.value)
+         assert.NotNil(t, lock.client)
+         tc.after(t)
+      })
+   }
+}
+```
 
 ##### singleflight优化
 

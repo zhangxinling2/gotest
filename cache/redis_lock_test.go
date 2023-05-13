@@ -318,7 +318,9 @@ func TestClient_Lock(t *testing.T) {
 				cmd := mocks.NewMockCmdable(ctrl)
 				res := redis.NewCmd(context.Background())
 				res.SetVal(int64(1))
-				cmd.EXPECT().Eval(context.Background(), luaLock, []string{"lock_key1"}, gomock.Any(), float64(60)).Return(res)
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+				cmd.EXPECT().Eval(ctx, luaLock, []string{"lock_key1"}, gomock.Any(), float64(60)).Return(res)
+				cancel()
 				return cmd
 			},
 			key:        "lock_key1",

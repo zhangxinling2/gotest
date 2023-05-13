@@ -4,10 +4,11 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"github.com/go-redis/redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"log"
+
 	"testing"
 	"time"
 )
@@ -232,6 +233,91 @@ func TestLock_Refresh2(t *testing.T) {
 			if err != nil {
 				return
 			}
+			tc.after(t)
+		})
+	}
+}
+func TestClient_Lock2(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	testCases := []struct {
+		name   string
+		key    string
+		before func(t *testing.T)
+		after  func(t *testing.T)
+		//key 过期时间
+		expiration time.Duration
+		//重试间隔
+		timeout time.Duration
+		//重试策略
+		retry    RetryStrategy
+		wantLock *Lock
+		wantErr  error
+	}{
+		{
+			name: "locked",
+			before: func(t *testing.T) {
+			},
+			after: func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+				defer cancel()
+				timeout, err := rdb.TTL(ctx, "lock_key1").Result()
+				require.NoError(t, err)
+				require.True(t, timeout >= time.Second*50)
+				_, err = rdb.Del(ctx, "lock_key1").Result()
+				require.NoError(t, err)
+			},
+			key:        "lock_key1",
+			expiration: time.Minute,
+			timeout:    time.Second * 2,
+			retry: &FixedIntervalRetryStrategy{
+				Interval: time.Second,
+				MaxCnt:   10,
+			},
+			wantLock: &Lock{
+				key:        "lock_key1",
+				expiration: time.Minute,
+			},
+		},
+		{
+			name: "others hold lock",
+			before: func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+				defer cancel()
+				res, err := rdb.Set(ctx, "lock_key2", "123", time.Minute).Result()
+				require.NoError(t, err)
+				require.Equal(t, "OK", res)
+			},
+			after: func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+				defer cancel()
+				res, err := rdb.GetDel(ctx, "lock_key2").Result()
+				require.NoError(t, err)
+				require.Equal(t, "123", res)
+			},
+			key:        "lock_key2",
+			expiration: time.Minute,
+			timeout:    time.Second * 3,
+			retry: &FixedIntervalRetryStrategy{
+				Interval: time.Second,
+				MaxCnt:   3,
+			},
+			wantErr: fmt.Errorf("redis-lock: 超出重试限制, %w", errFailToPreemptLock),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.before(t)
+			client := NewClient(rdb)
+			lock, err := client.Lock(context.Background(), tc.key, tc.expiration, tc.timeout, tc.retry)
+			assert.Equal(t, tc.wantErr, err)
+			if err != nil {
+				return
+			}
+			assert.Equal(t, tc.wantLock.key, lock.key)
+			assert.Equal(t, tc.wantLock.expiration, lock.expiration)
+			assert.NotEmpty(t, lock.value)
+			assert.NotNil(t, lock.client)
 			tc.after(t)
 		})
 	}

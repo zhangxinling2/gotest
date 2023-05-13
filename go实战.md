@@ -3447,20 +3447,111 @@ func (l *Lock) Unlock(ctx context.Context) error {
 
 在client上定义Lock(ctx,key,expiration,timeout,retry)(*Lock,error)方法用来加锁，retry时自定义的RetryStrategy接口类型，内部有一个Next()(time.Duration,bool)，第一个返回值是重试的间隔，第二个是是否重试。
 
+这是一种迭代器的形态，用户可以轻易通过扩展这个接口来实现自己的重试策略。缺点就是没有引入上下文的概念。
+
 如果不同的key对应不同的策略那么retry就可以放在lock中，如果都是相同的策略那么retry可以集成在client中。
 
 创建一个计时器 timer，在for循环中，使用trylock，先得到Next的返回值，之后判断是否重置，如果ok，那么就判断timer是初始化还是需要reset。后面就用一个select来控制超时。
 
+```go
+//Lock 与tryLock不同的是它是重试加锁,timeout时重试的超时时间
+func (c *Client) Lock(ctx context.Context, key string, expiration,timeout time.Duration,retry RetryStrategy) (*Lock, error){
+   val := uuid.New().String()
+   //重试的计时器
+   var timer *time.Timer
+   for{
+      tctx,cancel:=context.WithTimeout(ctx,timeout)
+      res,err:=c.client.Eval(tctx,luaLock,[]string{key},val,expiration.Seconds()).Result()
+      cancel()
+      if err!=nil&&err!=context.DeadlineExceeded{
+         return nil, err
+      }
+      //加锁ok了
+      if res=="OK"{
+         return &Lock{
+            client:     c.client,
+            key:        key,
+            value:      val,
+            expiration: expiration,
+            unlockCh: make(chan struct{}, 1),
+         },nil
+      }
+      //加锁失败，进行重试
+      interval,ok:=retry.Next()
+      //超出重试次数
+      if !ok{
+         return nil, fmt.Errorf("redis-lock: 超出重试限制, %w", errFailToPreemptLock)
+      }
+      //没有超出，则重置计时器
+      if timer==nil{
+         timer=time.NewTimer(interval)
+      }else{
+         timer.Reset(interval)
+      }
+      select {
+      case <-timer.C:
+         //什么都不用干，步入下一个循环
+      case <-ctx.Done():
+         return nil, ctx.Err()
+      }
+   }
+}
+```
+
 直接使用trylock是不行的，因为我们有三种情况，就需要在lua脚本中照着三种情况写脚本。不需要使用SetNx因为已经判断不存在这个key了，而lua在redis执行中是单线程的。
+
+```lua
+local val = redis.call('get',KEYS[1])
+if val==false then
+    --可以进行加锁
+    return redis.call('set',KEYS[1],ARGV[1])
+else if val==ARGV[1] then
+    redis.call('expire',KEYS[1],ARGV[2])
+    --因为set的返回值也是ok
+    return 'OK'
+else
+    --锁被别人拿着
+    return ''
+end
+```
 
 ###### 踩坑
 
-lua中使用redis的get得到不存在的值时返回的时false。
+lua中使用redis的get得到不存在的值时返回的时false,涉及redis，go，lua三个值类型切换的问题。
 
-由于set成功是返回ok,而expire是返回0，1，所以不return expire而是手动返回ok
+由于set成功是返回ok,而expire是返回0，1，所以不return expire而是手动返回ok。
+
+直接使用val = redis.call('get',KEYS[1])会报错试图更改readonly table script
 
 ###### 单元测试
 
 ###### 集成测试
 
-加锁重试重点还是在于跟redis的交互，所以重点还是测的lua脚本的情况。集成测试中ctx超时是比较难测的，因为正常环境下是比较稳定的，所以正常情况下是不测的。
+加锁重试重点还是在于跟redis的交互，所以重点还是测的lua脚本的情况。集成测试中ctx超时是比较难测的，在模拟环境中好测，因为正常环境下是比较稳定的，所以正常情况下是不测的。
+
+实现一个retry用来测试.
+
+测试情况：
+
+1.成功拿到锁
+
+2.别人持有锁，且重试次数超过限制
+
+3.别人持有锁，但在重试时别人释放掉锁
+
+##### singleflight优化
+
+在非常高并发并且热点集中的情况下，可以考虑结合singleflight来进行优化，也就是本地所有的goroutine自己先竞争，胜利者再去竞争全局的分布式锁。
+
+###### 思路
+
+内部会沿用lock的重试机制，在redislock中维持singleflighr.group,在一个for循环中使用DoChan,其中运行Lock。DoChan返回了，要判断是不是自己拿到了锁。设置一个flag，在DoChan中设为true，为true的那个就是拿到了锁。以防万一，加一个c.g.Forget(key)来确保其他goroutine能运行这段代码
+
+###### 测试
+
+要测试singleflight要开不同的进程才能测。
+
+##### Redis主从切换
+
+在主机加锁成功后，还没有复制到从机，主机宕机，从机提升为主机，那么另一个客户端也可以用这个key加锁成功，那么客户端1释放锁，释放了客户端2的锁。
+

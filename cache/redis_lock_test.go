@@ -299,3 +299,56 @@ func ExampleLock_Refresh() {
 	stopChan <- struct{}{}
 	// l.Unlock(context.Background())
 }
+func TestClient_Lock(t *testing.T) {
+	testCases := []struct {
+		name string
+		mock func(ctrl *gomock.Controller) redis.Cmdable
+		key  string
+		//key 过期时间
+		expiration time.Duration
+		//重试间隔
+		timeout time.Duration
+		//重试策略
+		retry   RetryStrategy
+		wantErr error
+	}{
+		{
+			name: "locked",
+			mock: func(ctrl *gomock.Controller) redis.Cmdable {
+				cmd := mocks.NewMockCmdable(ctrl)
+				res := redis.NewCmd(context.Background())
+				res.SetVal(int64(1))
+				cmd.EXPECT().Eval(context.Background(), luaLock, []string{"lock_key1"}, gomock.Any(), float64(60)).Return(res)
+				return cmd
+			},
+			key:        "lock_key1",
+			expiration: time.Minute,
+			timeout:    time.Second * 3,
+			retry: &FixedIntervalRetryStrategy{
+				Interval: time.Second * 3,
+				MaxCnt:   10,
+				cnt:      0,
+			},
+		},
+	}
+	ctrl := gomock.NewController(t)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := NewClient(tc.mock(ctrl))
+			wantLock := &Lock{
+				client:     NewClient(tc.mock(ctrl)).client,
+				key:        tc.key,
+				expiration: tc.expiration,
+			}
+			lock, err := client.Lock(context.Background(), tc.key, tc.expiration, tc.timeout, tc.retry)
+			assert.Equal(t, tc.wantErr, err)
+			if err != nil {
+				return
+			}
+			assert.Equal(t, wantLock.key, lock.key)
+			//无法得到准确的value只能通过判断是否有值做粗略的检查
+			assert.NotEmpty(t, lock.value)
+			assert.NotNil(t, wantLock.client)
+		})
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/go-redis/redis/v9"
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 	"time"
 )
 
@@ -25,10 +26,37 @@ var (
 //Client 用于加锁
 type Client struct {
 	client redis.Cmdable
+	g      *singleflight.Group
 }
 
 func NewClient(client redis.Cmdable) *Client {
-	return &Client{client: client}
+	return &Client{client: client,
+		g: &singleflight.Group{}}
+}
+func (c *Client) SingleLock(ctx context.Context, key string, expiration, timeout time.Duration, retry RetryStrategy) (*Lock, error) {
+	for {
+		flag := false
+		resCh := c.g.DoChan(key, func() (interface{}, error) {
+			lock, err := c.Lock(ctx, key, expiration, timeout, retry)
+			if err != nil {
+				return nil, err
+			}
+			flag = true
+			return lock, nil
+		})
+		select {
+		case res := <-resCh:
+			if flag {
+				c.g.Forget(key)
+				if res.Err != nil {
+					return nil, res.Err
+				}
+				return res.Val.(*Lock), nil
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 //Lock 与tryLock不同的是它是重试加锁,timeout时重试的超时时间

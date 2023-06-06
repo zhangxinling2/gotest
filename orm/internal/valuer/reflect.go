@@ -14,49 +14,51 @@ type reflectValue struct {
 	//val any
 	val reflect.Value
 }
-func NewReflectValue(model *model.Model,val any)Value{
+
+func NewReflectValue(model *model.Model, val any) Value {
 	return reflectValue{
 		model: model,
-		val: reflect.ValueOf(val).Elem(),
+		val:   reflect.ValueOf(val).Elem(),
 	}
 }
 
-func(r reflectValue)Field(name string)(any,error){
+func (r reflectValue) Field(name string) (any, error) {
 	//检测 name 是否合法
 	//_,ok:=r.val.Type().FieldByName(name)
 	//if !ok{
 	//	//报错
 	//}
-	val:=r.val.FieldByName(name).Interface()
+	val := r.val.FieldByName(name).Interface()
 	//if val==(reflect.Value{}){
 	//
 	//}
-	return val,nil
+	return val, nil
 }
 
-var _ Creator=NewReflectValue
-func (r reflectValue) SetColumns(rows *sql.Rows) error {
-	cs,err:=rows.Columns()
-	if err!=nil{
-		return  err
-	}
-	vals:=make([]any,0,len(cs))
+var _ Creator = NewReflectValue
 
-	valElem:=make([]reflect.Value,0,len(cs))
-	for _,c:=range cs{
+func (r reflectValue) SetColumns(rows *sql.Rows) error {
+	cs, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+	vals := make([]any, 0, len(cs))
+
+	valElem := make([]reflect.Value, 0, len(cs))
+	for _, c := range cs {
 		//c是列名
-		fd,ok:=r.model.ColumnMap[c]
-		if !ok{
+		fd, ok := r.model.ColumnMap[c]
+		if !ok {
 			return errs.NewUnknownColumn(c)
 		}
 		//反射创建新的实例
 		//这里创建的实例是原本类型的指针
 		//例如 fd.type=int 那么val是*int
-		val:=reflect.New(fd.Type)
+		val := reflect.New(fd.Type)
 		//这样scan就不用取地址了
-		vals=append(vals, val.Interface())
+		vals = append(vals, val.Interface())
 
-		valElem=append(valElem, val.Elem())
+		valElem = append(valElem, val.Elem())
 
 		//for _,fd:=range s.model.fieldMap{
 		//	if fd.colName==c{
@@ -69,17 +71,17 @@ func (r reflectValue) SetColumns(rows *sql.Rows) error {
 		//	}
 		//}
 	}
-	err=rows.Scan(vals...)
-	if err!=nil{
-		return  err
+	err = rows.Scan(vals...)
+	if err != nil {
+		return err
 	}
-	tpValue:=r.val
-	for i,c:=range cs{
-		fd,ok:=r.model.ColumnMap[c]
-		if !ok{
+	tpValue := r.val
+	for i, c := range cs {
+		fd, ok := r.model.ColumnMap[c]
+		if !ok {
 			return errs.NewUnknownColumn(c)
 		}
-		tpValue.Elem().FieldByName(fd.GoName).Set(valElem[i])
+		tpValue.FieldByName(fd.GoName).Set(valElem[i])
 		//for _,fd:=range s.model.fieldMap{
 		//	if fd.colName==c{
 		//		tpValue.Elem().FieldByName(fd.goName).Set(reflect.ValueOf(vals[i]).Elem())
@@ -88,7 +90,5 @@ func (r reflectValue) SetColumns(rows *sql.Rows) error {
 
 	}
 
-
-	return  nil
+	return nil
 }
-

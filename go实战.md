@@ -1451,7 +1451,7 @@ func(b *BuildInMapCache)delete(key string){
 
 ###### 踩坑
 
-在delete中加了锁，而调用delete之前也加了锁，导致程序卡死。
+在实现时在delete中加了锁，而调用delete之前也加了锁，导致程序卡死。
 
 ###### 测试轮询效果
 
@@ -1532,7 +1532,7 @@ func (c *MaxCntCache) Set(ctx context.Context, key string, val any, expiration t
    // return errOverCapacity
    //}
    //return c.BuildInMapCache.Set(ctx, key, val, expiration)
-
+	//这样写在unlock后如果有goroutine拿到锁后再次进行set而此goroutine中的Set还未结束的话仍然会导致计数错误
    //c.mutex.Lock()
    //_, ok := c.data[key]
    //if !ok {

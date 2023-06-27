@@ -2,9 +2,9 @@ package rpc
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"github.com/silenceper/pool"
 	"net"
 	"reflect"
 	"time"
@@ -79,7 +79,7 @@ func setFuncField(service Service, p Proxy) error {
 }
 
 type Client struct {
-	addr string
+	pool pool.Pool
 }
 
 func (c *Client) Invoke(ctx context.Context, req *Request) (*Response, error) {
@@ -98,16 +98,21 @@ func (c *Client) Invoke(ctx context.Context, req *Request) (*Response, error) {
 	return &Response{data: res}, nil
 }
 func (c *Client) Send(data []byte) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", c.addr, time.Second*3)
+	val, err := c.pool.Get()
+	if err != nil {
+		return nil, err
+	}
+	conn := val.(net.Conn)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		conn.Close()
 	}()
-	reqData := make([]byte, len(data)+numOfLengthByte)
-	binary.BigEndian.PutUint64(reqData[:numOfLengthByte], uint64(len(data)))
-	copy(reqData[numOfLengthByte:], data)
+	reqData, err := EncodeMsg(data)
+	if err != nil {
+		return nil, err
+	}
 	_, err = conn.Write(reqData)
 	if err != nil {
 		return nil, err
@@ -119,7 +124,23 @@ func (c *Client) Send(data []byte) ([]byte, error) {
 	return resData, nil
 }
 func NewClient(addr string) *Client {
+	config := &pool.Config{
+		InitialCap:  1,
+		MaxCap:      30,
+		MaxIdle:     10,
+		IdleTimeout: time.Minute,
+		Factory: func() (interface{}, error) {
+			return net.DialTimeout("tcp", addr, time.Second*3)
+		},
+		Close: func(i interface{}) error {
+			return i.(net.Conn).Close()
+		},
+	}
+	p, err := pool.NewChannelPool(config)
+	if err != nil {
+		return nil
+	}
 	return &Client{
-		addr: addr,
+		pool: p,
 	}
 }

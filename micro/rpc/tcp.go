@@ -21,5 +21,8 @@ func ReadMsg(conn net.Conn) ([]byte, error) {
 	return data, nil
 }
 func EncodeMsg(data []byte) ([]byte, error) {
-	return nil, nil
+	respData := make([]byte, len(data)+numOfLengthByte)
+	binary.BigEndian.PutUint64(respData[:numOfLengthByte], uint64(len(data)))
+	copy(respData[numOfLengthByte:], data)
+	return respData, nil
 }

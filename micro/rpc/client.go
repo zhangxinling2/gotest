@@ -2,20 +2,30 @@ package rpc
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
-	"fmt"
+	"net"
 	"reflect"
+	"time"
 )
 
-func InitClientProxy(service Service) error {
+const (
+	numOfLengthByte = 8
+)
+
+func InitClientProxy(service Service, addr string) error {
+	//初始化Client
+	client := NewClient(addr)
 	//在这里初始化一个Proxy
-	return setFuncField(service, nil)
+	return setFuncField(service, client)
 }
 
 func setFuncField(service Service, p Proxy) error {
 	if service == nil {
 		return errors.New("服务是空服务")
 	}
+
 	//判断是否是结构体指针
 	val := reflect.ValueOf(service)
 	typ := val.Type()
@@ -33,22 +43,30 @@ func setFuncField(service Service, p Proxy) error {
 		fieldVal := val.Field(i)
 		if fieldVal.CanSet() {
 			fn := func(args []reflect.Value) (results []reflect.Value) {
+				//resp反序列化进ret
+				ret := reflect.New(fieldTyp.Type.Out(0).Elem())
 				//如何赋值？需要知道三个调用信息，服务名，方法名和参数
+				reqData, err := json.Marshal(args[1].Interface())
+				if err != nil {
+					return []reflect.Value{ret, reflect.ValueOf(err)}
+				}
 				req := &Request{
 					//服务名怎么得到？让服务实现Name
 					ServiceName: service.Name(),
 					MethodName:  fieldTyp.Name,
 					//因为我们已经知道第一个参数是ctx,第二个是req，context本身是不会传到服务端的
-					Args: []any{args[1].Interface()},
+					Args: reqData,
 				}
 				//赋完了值，就该发起调用了
 				//var p Proxy
 				resp, err := p.Invoke(args[0].Interface().(context.Context), req)
+
+				err = json.Unmarshal(resp.data, ret.Interface())
 				if err != nil {
-					return []reflect.Value{reflect.Zero(fieldTyp.Type.Out(0)), reflect.ValueOf(err)}
+					return []reflect.Value{ret, reflect.ValueOf(err)}
 				}
-				fmt.Println(resp)
-				return []reflect.Value{reflect.Zero(fieldTyp.Type.Out(0)), reflect.ValueOf((*error)(nil)).Elem()}
+
+				return []reflect.Value{ret, reflect.Zero(reflect.TypeOf(new(error)).Elem())}
 			}
 			//创建方法，第一个type 自然就是字段的type 把func提取出去
 			fnVal := reflect.MakeFunc(fieldTyp.Type, fn)
@@ -58,4 +76,50 @@ func setFuncField(service Service, p Proxy) error {
 	}
 
 	return nil
+}
+
+type Client struct {
+	addr string
+}
+
+func (c *Client) Invoke(ctx context.Context, req *Request) (*Response, error) {
+	//发送请求到服务器
+	//新建一个连接来发送请求
+	//直接把net中的send拷过来使用
+	//编码发送请求
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	res, err := c.Send(data)
+	if err != nil {
+		return nil, err
+	}
+	return &Response{data: res}, nil
+}
+func (c *Client) Send(data []byte) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", c.addr, time.Second*3)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		conn.Close()
+	}()
+	reqData := make([]byte, len(data)+numOfLengthByte)
+	binary.BigEndian.PutUint64(reqData[:numOfLengthByte], uint64(len(data)))
+	copy(reqData[numOfLengthByte:], data)
+	_, err = conn.Write(reqData)
+	if err != nil {
+		return nil, err
+	}
+	resData, err := ReadMsg(conn)
+	if err != nil {
+		return nil, err
+	}
+	return resData, nil
+}
+func NewClient(addr string) *Client {
+	return &Client{
+		addr: addr,
+	}
 }

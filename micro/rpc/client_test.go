@@ -25,7 +25,7 @@ func TestSetFuncField(t *testing.T) {
 		},
 		{
 			name:    "no pointer",
-			service: UserService{},
+			service: &UserService{},
 			mock: func(ctrl *gomock.Controller) Proxy {
 				return NewMockProxy(ctrl)
 			},
@@ -35,7 +35,11 @@ func TestSetFuncField(t *testing.T) {
 			name: "user service ",
 			mock: func(ctrl *gomock.Controller) Proxy {
 				p := NewMockProxy(ctrl)
-				p.EXPECT().Invoke(gomock.Any(), gomock.Any()).Return(&Response{}, nil)
+				p.EXPECT().Invoke(gomock.Any(), &Request{
+					ServiceName: "user-service",
+					MethodName:  "GetById",
+					Args:        []byte("Id:123"),
+				}).Return(&Response{}, nil)
 				return p
 			},
 			service: &UserService{},

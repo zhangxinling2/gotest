@@ -13,7 +13,7 @@ type Proxy interface {
 type Request struct {
 	ServiceName string
 	MethodName  string
-	Args        []any
+	Args        []byte
 }
 
 func (r *Request) Name() string {
@@ -22,4 +22,5 @@ func (r *Request) Name() string {
 }
 
 type Response struct {
+	data []byte //存储接收到的响应
 }

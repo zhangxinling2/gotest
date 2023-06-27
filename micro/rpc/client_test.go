@@ -38,7 +38,7 @@ func TestSetFuncField(t *testing.T) {
 				p.EXPECT().Invoke(gomock.Any(), &Request{
 					ServiceName: "user-service",
 					MethodName:  "GetById",
-					Args:        []byte("Id:123"),
+					Data:        []byte("Id:123"),
 				}).Return(&Response{}, nil)
 				return p
 			},

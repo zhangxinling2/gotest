@@ -59,7 +59,7 @@ func (s *Server) handleConn(conn net.Conn) error {
 			return err
 		}
 		//写数据
-		respData, err := EncodeMsg(res.data)
+		respData, err := EncodeMsg(res.Data)
 		if err != nil {
 			return err
 		}
@@ -76,11 +76,11 @@ func (s *Server) Invoke(ctx context.Context, req *Request) (*Response, error) {
 	if !ok {
 		return nil, errors.New("没有这个服务")
 	}
-	resp, err := ser.Invoke(ctx, req.MethodName, req.Args)
+	resp, err := ser.Invoke(ctx, req.MethodName, req.Data)
 	if err != nil {
 		return nil, err
 	}
-	return &Response{data: resp}, nil
+	return &Response{Data: resp}, nil
 }
 
 type reflectStub struct {

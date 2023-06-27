@@ -55,13 +55,13 @@ func setFuncField(service Service, p Proxy) error {
 					ServiceName: service.Name(),
 					MethodName:  fieldTyp.Name,
 					//因为我们已经知道第一个参数是ctx,第二个是req，context本身是不会传到服务端的
-					Args: reqData,
+					Data: reqData,
 				}
 				//赋完了值，就该发起调用了
 				//var p Proxy
 				resp, err := p.Invoke(args[0].Interface().(context.Context), req)
 
-				err = json.Unmarshal(resp.data, ret.Interface())
+				err = json.Unmarshal(resp.Data, ret.Interface())
 				if err != nil {
 					return []reflect.Value{ret, reflect.ValueOf(err)}
 				}
@@ -95,7 +95,7 @@ func (c *Client) Invoke(ctx context.Context, req *Request) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Response{data: res}, nil
+	return &Response{Data: res}, nil
 }
 func (c *Client) Send(data []byte) ([]byte, error) {
 	val, err := c.pool.Get()

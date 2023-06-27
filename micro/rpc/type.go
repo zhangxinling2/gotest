@@ -11,9 +11,16 @@ type Proxy interface {
 }
 
 type Request struct {
+	HeadLength  uint32
+	BodyLength  uint32
+	RequestID   uint32
+	Version     uint8
+	Compresser  uint8
+	Serializer  uint8
 	ServiceName string
 	MethodName  string
-	Args        []byte
+	Meta        map[string]string
+	Data        []byte
 }
 
 func (r *Request) Name() string {
@@ -22,5 +29,12 @@ func (r *Request) Name() string {
 }
 
 type Response struct {
-	data []byte //存储接收到的响应
+	HeadLength uint32
+	BodyLength uint32
+	RequestID  uint32
+	Version    uint8
+	Compresser uint8
+	Serializer uint8
+	Error      []byte
+	Data       []byte //存储接收到的响应
 }

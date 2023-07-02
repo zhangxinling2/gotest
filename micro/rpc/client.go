@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/silenceper/pool"
+	"gotest/micro/rpc/message"
 	"net"
 	"reflect"
 	"time"
@@ -50,7 +51,7 @@ func setFuncField(service Service, p Proxy) error {
 				if err != nil {
 					return []reflect.Value{ret, reflect.ValueOf(err)}
 				}
-				req := &Request{
+				req := &message.Request{
 					//服务名怎么得到？让服务实现Name
 					ServiceName: service.Name(),
 					MethodName:  fieldTyp.Name,
@@ -82,7 +83,7 @@ type Client struct {
 	pool pool.Pool
 }
 
-func (c *Client) Invoke(ctx context.Context, req *Request) (*Response, error) {
+func (c *Client) Invoke(ctx context.Context, req *message.Request) (*message.Response, error) {
 	//发送请求到服务器
 	//新建一个连接来发送请求
 	//直接把net中的send拷过来使用
@@ -95,7 +96,7 @@ func (c *Client) Invoke(ctx context.Context, req *Request) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Response{Data: res}, nil
+	return &message.Response{Data: res}, nil
 }
 func (c *Client) Send(data []byte) ([]byte, error) {
 	val, err := c.pool.Get()
